@@ -14,6 +14,8 @@ test('package.json UTF-8 BOM still detects npm test', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('detects npm test from package.json scripts.test', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-npm-'));
   try {
     await writeFile(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', scripts: { test: 'node -e "process.exit(0)"' } }), 'utf8');
