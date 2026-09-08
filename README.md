@@ -1,21 +1,23 @@
 # Multi-Model AI Orchestrator
 
-A local multi-model coding orchestrator for Cursor that intelligently routes development tasks between Cursor Agent, OpenAI Codex, Google Gemini/Antigravity, or a coordinated multi-agent team workflow.
+A local multi-model coding orchestrator for Cursor that routes development tasks between Cursor Agent, OpenAI Codex, Google Gemini/Antigravity, or a coordinated multi-agent team.
 
-Current version: **v0.8.0** (see `package.json`).
+Current version: **v0.8.0**
+
+**Validated platform: Windows.** macOS and Linux are not claimed and have not been tested as supported hosts.
 
 ## Overview
 
-Choosing the right coding model for every task is slow and easy to get wrong. This project is a local orchestrator that sits between Cursor Chat and several CLI workers. You describe the work once; the orchestrator selects a route, isolates Git changes, runs the worker, and (for modifying routes) executes the target project's own tests.
+This project sits between Cursor Chat and several local CLI workers. You describe a development task once. The orchestrator chooses a route, isolates Git changes in a worktree, runs the selected worker, and for modifying routes executes the **target project's own tests**.
 
-Instead of manually picking one AI model for every development task, the orchestrator can select between:
+The opened Cursor workspace is the source repository. This orchestrator directory stores `runs/` and `worktrees/`. It is not the project you normally edit.
 
-- **Cursor Agent / Cursor models** for UI, CSS, frontend, and general development
-- **OpenAI Codex CLI** for focused coding, bug fixes, backend work, and tests
-- **Google Gemini via Antigravity CLI** for analysis, architecture review, and large-context investigation
-- **TEAM workflow** for higher-risk work that needs a plan, implementation, independent tests, and review
+Instead of picking one model by hand for every task, v0.8 can send work to:
 
-It is designed primarily for **local development inside Cursor on Windows**. The opened project is the source repository. This orchestrator directory stores run logs and isolated Git worktrees; it is not the repo you normally edit.
+- **CURSOR** — Cursor Agent CLI (default model `auto`)
+- **CODEX** — OpenAI Codex CLI (`codex exec`)
+- **GEMINI** — Google Gemini via Antigravity CLI (`agy -p`)
+- **TEAM** — Cursor plan, Codex implement, independent tests, Gemini review, bounded Codex fix loop
 
 ## Architecture
 
@@ -24,10 +26,10 @@ flowchart TD
   chat[Cursor Chat]
   skill["/ai or /ai-team"]
   orch[AI Orchestrator]
-  router[Router]
+  router[Auto Router]
   cursor[CURSOR<br/>Cursor Agent]
   codex[CODEX<br/>Codex CLI]
-  gemini[GEMINI<br/>Antigravity CLI]
+  gemini[GEMINI<br/>Antigravity]
   team[TEAM]
 
   chat --> skill --> orch --> router
@@ -42,274 +44,246 @@ flowchart TD
   tests --> review[Gemini Review]
 ```
 
-TEAM review loop when Gemini returns `NEEDS_FIXES` or independent tests fail (bounded by `--max-fix-rounds`, default 2):
+TEAM when Gemini returns `NEEDS_FIXES` or independent tests fail:
 
 ```mermaid
 flowchart TD
-  gemini[Gemini review]
+  review[Gemini review]
   needs[NEEDS_FIXES or test FAIL]
   fix[Codex fix]
   tests[Independent tests]
   rereview[Gemini re-review]
 
-  gemini --> needs --> fix --> tests --> rereview
+  review --> needs --> fix --> tests --> rereview
 ```
 
-The orchestrator itself does not merge to `main`/`master` and does not push.
+The orchestrator does not merge to `main`/`master` and does not push.
 
-## Features
+## CURSOR / CODEX / GEMINI / TEAM routes
 
-Implemented in v0.8.0:
+| Route | Worker | Typical use |
+| --- | --- | --- |
+| `CURSOR` | Cursor Agent CLI | UI, CSS, frontend, docs, quick edits |
+| `CODEX` | Codex CLI | Focused coding, backend, bug fixes, tests |
+| `GEMINI` | Antigravity CLI | Analysis, architecture, review, large-context investigation |
+| `TEAM` | Cursor + Codex + tests + Gemini | High-risk or cross-cutting work |
 
-- Automatic task routing (`CURSOR`, `CODEX`, `GEMINI`, `TEAM`) with a confidence score
-- Explicit worker modes that override automatic routing
-- Cursor models through Cursor Agent CLI (default model: `auto`)
-- Codex implementation worker (`codex exec`, non-interactive)
-- Gemini analysis and review worker through Antigravity CLI (`agy -p`)
-- TEAM workflow: Cursor plans, Codex implements, independent tests run, Gemini reviews
-- Codex fix loop after test failures or `NEEDS_FIXES` (default max 2 rounds)
-- Git worktree isolation under this project's `worktrees/` directory
-- Main workspace protection: dirty source repos are refused; unexpected source changes are a safety failure
-- Generated `ai/<run-id>` branches
-- Optional `--commit-on-pass` on the isolated branch only
-- Run logs under `runs/<run-id>/`
-- Cursor `/ai` and `/ai-team` skills (installed by script)
-- `npm run doctor` environment checks
-- Worker smoke tests (`npm run cursor-test`, `npm run agy-test`)
-- Independent test runner for the target project (npm, PHPUnit via Artisan, Flutter/Dart, Cargo, Go, .NET, pytest)
-- Per-worker timeouts, process-tree kill on Windows, and limited retries for transient CLI/network failures
-- Artifact cleanup command (`npm run cleanup`, dry-run by default)
-- Gemini read-only safety: `--mode plan --sandbox`, git snapshot before/after, reject if files changed
-
-`--mode agy` is accepted as backwards compatibility for `gemini`. User-facing labels say **GEMINI**.
-
-## Routing
-
-Explicit `--mode` values override automatic routing and report confidence 100%.
+`--mode agy` is a backwards-compatible alias of `gemini`. Labels still say **GEMINI**.
 
 ### CURSOR
-
-UI, CSS, general frontend, documentation, and quick development work.
 
 Example: `/ai Improve the dashboard layout`
 
 ### CODEX
 
-Focused coding, backend implementation, bug fixes, and tests.
-
 Example: `/ai Fix the registration validation bug and add tests`
 
 ### GEMINI
 
-Repository analysis, architecture analysis, review, and large-context investigation. Gemini is treated as read-only; modifying the worktree is a safety violation.
+Read-only analysis. If Gemini changes files, the run is rejected as a safety violation.
 
 Example: `/ai Analyze this repository and identify maintainability issues`
 
 ### TEAM
 
-Complex or high-risk work that should be planned, implemented, tested, and independently reviewed.
-
 Example: `/ai-team Refactor authentication across the application and add tests`
 
-## Requirements
+## Auto Router
 
-Verified on **Windows**. Linux and macOS are **not verified**.
+`--mode auto` (used by `/ai`) classifies the task text and picks `CURSOR`, `CODEX`, `GEMINI`, or `TEAM`. It records a **route confidence** score (0–1) plus risk and complexity in `runs/<run-id>/route.json`.
 
-You need:
+Explicit `--mode cursor|codex|gemini|agy|team` **overrides** the auto router and reports confidence **100%**.
 
-- Windows
+## Cursor → Codex → Gemini TEAM workflow
+
+1. **Cursor** writes a read-only implementation plan (`plan.txt`).
+2. **Codex** implements in the isolated worktree (`implementation.txt`).
+3. The **independent test runner** runs the project's real test command.
+4. **Gemini** reviews the current tree and git diff. The first non-empty line of the review must be `PASS` or `NEEDS_FIXES`.
+
+## Gemini NEEDS_FIXES → Codex fix → tests → Gemini re-review
+
+If tests fail/timeout or Gemini returns `NEEDS_FIXES`, Codex receives the test output and/or review text, applies a fix (`fix-round-N.txt`), tests run again, and Gemini re-reviews. Rounds are bounded by `--max-fix-rounds` (default **2**, max 5). There is no automatic merge.
+
+## Git worktree isolation
+
+Modifying tasks create an isolated Git worktree under this project's `worktrees/` directory, usually on branch `ai/<run-id>` (or `--branch`). Agents edit that copy, not your opened workspace.
+
+`--in-place` disables isolation and is not recommended. Cursor skills do not pass `--in-place`.
+
+## Main workspace protection
+
+- Source must be a Git repo with a valid `HEAD` (at least one commit).
+- A dirty source tree **refuses** the run. The orchestrator never `reset`s, `clean`s, or discards your files.
+- After the run, the source fingerprint is checked again. Unexpected source changes are a **SAFETY FAILURE**.
+- Optional `--commit-on-pass` commits only on the isolated `ai/...` branch when implementation succeeded, tests are PASS or SKIP, TEAM review is PASS, and there is no safety violation.
+
+## Independent test runner
+
+After CURSOR, CODEX, and TEAM implementation (and after each fix round), the orchestrator runs a real test command in the worktree. **PASS/FAIL is the process exit code**, not an agent claim.
+
+Detection (first match only):
+
+1. `package.json` `scripts.test` → `npm test`
+2. `artisan` → `php artisan test`
+3. Flutter `pubspec.yaml` → `flutter test`
+4. other `pubspec.yaml` → `dart test`
+5. `Cargo.toml` → `cargo test`
+6. `go.mod` → `go test ./...`
+7. `*.sln` / `*.csproj` → `dotnet test`
+8. pytest layout → `pytest`
+
+If nothing matches: `Tests: SKIP` with reason `No supported test runner detected`. SKIP is not reported as PASS. FAIL/TIMEOUT blocks `--commit-on-pass`.
+
+## Timeouts
+
+| Worker | Default | Environment variable |
+| --- | --- | --- |
+| Cursor | 5 minutes | `AI_CURSOR_TIMEOUT_MS` |
+| Codex | 10 minutes | `AI_CODEX_TIMEOUT_MS` |
+| Gemini | 5 minutes | `AI_GEMINI_TIMEOUT_MS` |
+| Tests | 10 minutes | `AI_TEST_TIMEOUT_MS` |
+
+Timeouts kill the process tree (`taskkill /T` on Windows). Timed-out stages are `TIMEOUT`, not success.
+
+## Retry policy
+
+`AI_WORKER_MAX_RETRIES` default **1** (one extra attempt). Retries apply only to **transient CLI/network** failures (timeouts, rate limits, typical network errors). They do **not** apply to test failures, auth failures, dirty repos, or review `NEEDS_FIXES`.
+
+## Worktree cleanup
+
+| Variable | Default |
+| --- | --- |
+| `AI_KEEP_SUCCESS_WORKTREES` | `false` (remove after success via `git worktree remove`, after verifying the path is this run under `worktrees/`) |
+| `AI_KEEP_FAILED_WORKTREES` | `true` (keep for debugging) |
+
+Branches are kept. Maintenance (dry-run by default):
+
+```powershell
+npm run cleanup
+npm run cleanup -- --older-than-days 7
+npm run cleanup -- --apply --older-than-days 7
+```
+
+Only `runs/` and `worktrees/` folders whose names match orchestrator run-id patterns are considered.
+
+## Run logs
+
+Gitignored artifacts live in `runs/<run-id>/`:
+
+| File | Contents |
+| --- | --- |
+| `task.txt` | Task text |
+| `route.json` | Route, reason, **confidence**, risk, complexity |
+| `meta.json` | Run metadata, worktree, branch, commit result |
+| `plan.txt` | TEAM Cursor plan |
+| `implementation.txt` | Implementation summary |
+| `review.txt` | Gemini analysis or TEAM review |
+| `fix-round-N.txt` | TEAM Codex fix |
+| `tests.txt` | Independent test command, exit code, output |
+| `diff.patch` | Worktree diff when present |
+| `timings.json` | Stage durations |
+| `stages.json` | Stage status list |
+| `usage.json` | Duration, attempts, model; token counts only if a CLI provides them |
+| `error.txt` | Failure stack |
+| `gemini-safety.diff` | Diff if Gemini modified files |
+
+## Route confidence
+
+Auto routing writes `confidence` on the banner and in `route.json`. Explicit modes set confidence to `1`. Token or dollar cost is **not** available for every subscription-based worker; `usage.json` stores `usage: "unavailable"` unless the CLI returns usage data.
+
+## `/ai`
+
+Install skills, reload Cursor, then in the **target project** chat:
+
+```text
+/ai Fix the registration validation bug and add tests
+/ai Analyze this repository and identify maintainability issues
+/ai Improve the dashboard layout
+```
+
+`/ai` runs `--mode auto`. The runner detects the opened repo Git root. Task text is passed verbatim to `-Task`.
+
+## `/ai-team`
+
+```text
+/ai-team Refactor authentication across the application and add tests
+```
+
+Forces `--mode team` (same TEAM workflow as above).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-cursor-skills.ps1
+```
+
+Skills are written under `%USERPROFILE%\.cursor\skills\` and point at **this clone**. Restart or reload Cursor afterward.
+
+## Installation
+
+Windows only (validated):
+
+```powershell
+git clone https://github.com/trisha918/multi-model-ai-orchestrator.git
+cd multi-model-ai-orchestrator
+npm install
+npm run doctor
+```
+
+This package currently has no npm runtime dependencies; `npm install` is still the expected first step.
+
+### Authentication prerequisites
+
+The orchestrator does not store API keys in this repository. Authenticate each CLI:
+
+| Worker | Status check | Typical login |
+| --- | --- | --- |
+| Codex | `codex login status` reports logged in | `codex login` |
+| Antigravity / Gemini | `agy models` succeeds without modifying files | Sign in to Antigravity |
+| Cursor Agent | resolved agent `status` reports logged in | resolved agent `login` |
+
+Then `npm run doctor`. Cursor Agent is discovered from `%LOCALAPPDATA%\cursor-agent\` (`agent.cmd` or newest `versions\<ver>\cursor-agent.cmd`). PATH is not required. Codex: `%APPDATA%\npm\codex.cmd` or PATH. Antigravity: `%LOCALAPPDATA%\agy\bin\agy.exe` or PATH.
+
+## Windows requirements
+
+- Windows (validated host)
 - Git
-- Node.js 20 or later
+- Node.js 20+
 - npm
 - Cursor
 - Cursor Agent CLI
 - OpenAI Codex CLI
 - Google Antigravity CLI (`agy`)
 
-## Installation
-
-1. Clone the repository:
-
-```powershell
-git clone https://github.com/trisha918/multi-model-ai-orchestrator.git
-```
-
-2. Enter the repository:
-
-```powershell
-cd multi-model-ai-orchestrator
-```
-
-3. Install dependencies:
-
-```powershell
-npm install
-```
-
-This project currently has no npm runtime packages; `npm install` still prepares a local `node_modules` metadata tree and is the expected first step.
-
-4. Verify the environment:
+## Commands
 
 ```powershell
 npm run doctor
-```
-
-Doctor is read-only. It prints tool versions, authentication status, timeout configuration, and the `worktrees/` and `runs/` paths.
-
-### Authentication
-
-Use the CLIs themselves. The orchestrator does not store API keys in this repository.
-
-| Worker | Check | Typical login |
-| --- | --- | --- |
-| Codex | `codex login status` should report logged in | `codex login` |
-| Antigravity / Gemini | `agy models` should succeed without modifying files | Sign in to Antigravity, then retry `agy models` |
-| Cursor Agent | resolved `agent.cmd` / Cursor Agent `status` should report logged in | Run the resolved agent with `login` |
-
-Then re-run `npm run doctor` and, for Cursor, `npm run cursor-test`.
-
-Cursor Agent is discovered from `%LOCALAPPDATA%\cursor-agent\` (`agent.cmd`, or the newest `versions\<ver>\cursor-agent.cmd`). PATH is not required. Codex is resolved from `%APPDATA%\npm\codex.cmd` or PATH. Antigravity is resolved from `%LOCALAPPDATA%\agy\bin\agy.exe` or PATH.
-
-## Cursor Skills Installation
-
-Install `/ai` and `/ai-team` into your user Cursor skills directory:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-cursor-skills.ps1
-```
-
-The script writes skill files under `%USERPROFILE%\.cursor\skills\` and points them at **this clone** of the orchestrator via `scripts\run-task.ps1`. After installation, restart Cursor or reload the window.
-
-Open the **project you want to work on**, not this orchestrator repository, unless you intentionally want the orchestrator to modify itself.
-
-## Usage from Cursor Chat
-
-```text
-/ai Fix the registration validation bug and add tests
-/ai Analyze this repository and identify maintainability issues
-/ai Improve the dashboard layout
-/ai-team Refactor authentication across the application and add tests
-```
-
-- `/ai` uses `--mode auto` (router chooses CURSOR, CODEX, GEMINI, or TEAM).
-- `/ai-team` forces `--mode team`.
-
-The runner auto-detects the Git root of the opened workspace. Task text is passed verbatim to PowerShell `-Task`. Do not add `--in-place` from the skills.
-
-## Manual CLI Usage
-
-From the orchestrator clone:
-
-```powershell
-npm run task -- --repo "C:\Projects\my-app" --mode auto --commit-on-pass --task "Fix the login bug and add tests"
-```
-
-Supported modes:
-
-- `auto`
-- `cursor`
-- `codex`
-- `gemini`
-- `team`
-- `agy` (alias of `gemini`)
-
-Other flags:
-
-- `--commit-on-pass` — commit on the isolated `ai/...` branch when implementation succeeded, tests are PASS or SKIP, TEAM review is PASS, and no safety violation
-- `--max-fix-rounds 2` — TEAM Codex fix rounds (0–5)
-- `--cursor-model auto` — Cursor Agent model
-- `--branch ai/my-task` — optional branch name
-- `--windows-unelevated` — Codex Windows sandbox fallback
-- `--in-place` — disables Git isolation (not recommended; agents operate in the source repo)
-
-There is also `scripts\run-task.ps1`, which the Cursor skills call. If `-Repo` is omitted, it uses `git rev-parse --show-toplevel` from the current directory.
-
-## Git Safety
-
-- Modifying tasks run in isolated Git worktrees under this project's `worktrees/` folder.
-- The main workspace should remain unchanged.
-- The source repository must normally be clean (`git status --short` empty). Uncommitted changes refuse the run.
-- The orchestrator never automatically resets, cleans, or discards user files.
-- An initial Git commit is required before worktrees can be created.
-- AI work is created on `ai/<run-id>` branches (or a `--branch` you supply).
-- There is no automatic merge to `main`/`master` and no automatic push or deploy.
-- Successful worktrees are removed with `git worktree remove` after verifying the path is this run's directory (unless `AI_KEEP_SUCCESS_WORKTREES=true`). Branches are kept.
-- Failed worktrees are preserved for debugging by default (`AI_KEEP_FAILED_WORKTREES=true`).
-
-## Run Logs
-
-Artifacts are written to `runs/<run-id>/` and are gitignored. A run may include:
-
-| File | Contents |
-| --- | --- |
-| `task.txt` | The task text |
-| `route.json` | Route, reason, confidence, risk, complexity |
-| `meta.json` | Run metadata, worktree, branch, commit result |
-| `plan.txt` | TEAM Cursor plan |
-| `implementation.txt` | Worker implementation summary |
-| `review.txt` | Gemini analysis or TEAM review |
-| `fix-round-N.txt` | TEAM Codex fix output |
-| `tests.txt` | Independent test command, exit code, output |
-| `diff.patch` | Worktree git diff when present |
-| `timings.json` | Stage durations |
-| `stages.json` | Stage status list |
-| `usage.json` | Duration/attempts/model; token usage only if a CLI provides it |
-| `error.txt` | Failure stack when a stage throws |
-| `gemini-safety.diff` | Diff if Gemini modified files |
-
-## Testing
-
-```powershell
 npm test
 npm run cursor-test
 npm run agy-test
-npm run doctor
 npm run cleanup
+npm run task -- --repo "C:\Projects\my-app" --mode auto --commit-on-pass --task "Fix the login bug and add tests"
 ```
 
-| Command | What it validates |
+| Command | Purpose |
 | --- | --- |
-| `npm test` | Unit tests for routing, tooling, worktrees, Cursor Agent args, process helpers, test-runner detection, and cleanup |
-| `npm run cursor-test` | Cursor Agent status plus a small read-only headless prompt |
+| `npm run doctor` | Read-only tool versions, auth, timeouts, `runs/` and `worktrees/` paths |
+| `npm test` | Unit tests (routing, tooling, worktrees, Cursor args, process, test-runner, cleanup) |
+| `npm run cursor-test` | Cursor Agent status + small read-only headless prompt |
 | `npm run agy-test` | Antigravity headless prompt (`ANTIGRAVITY_OK`) |
-| `npm run doctor` | Tool presence, versions, auth checks, config paths |
-| `npm run cleanup` | Dry-run listing of old `runs/` and `worktrees/` folders |
+| `npm run cleanup` | Dry-run listing of old artifact folders |
 
-Cleanup apply example:
-
-```powershell
-npm run cleanup -- --apply --older-than-days 7
-```
-
-Only artifact folders whose names match orchestrator run-id patterns are considered.
-
-## Configuration
-
-Environment variables (defaults shown):
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `AI_CURSOR_TIMEOUT_MS` | `300000` (5 min) | Cursor Agent timeout |
-| `AI_CODEX_TIMEOUT_MS` | `600000` (10 min) | Codex timeout |
-| `AI_GEMINI_TIMEOUT_MS` | `300000` (5 min) | Gemini/Antigravity timeout |
-| `AI_TEST_TIMEOUT_MS` | `600000` (10 min) | Independent tests timeout |
-| `AI_WORKER_MAX_RETRIES` | `1` | Extra attempts for transient CLI/network failures only |
-| `AI_KEEP_SUCCESS_WORKTREES` | `false` | Keep worktrees after success |
-| `AI_KEEP_FAILED_WORKTREES` | `true` | Keep worktrees after failure |
-
-Retries do **not** apply to test failures, auth failures, dirty repos, or review `NEEDS_FIXES`. Timeouts terminate the process tree (`taskkill /T` on Windows). Timed-out stages are `TIMEOUT`.
-
-Copy `.env.example` only if you want a local reminder of these names. The Node process still needs the variables in the real environment unless you load them yourself.
+Manual modes: `auto`, `cursor`, `codex`, `gemini`, `team`, `agy`. Other flags: `--commit-on-pass`, `--max-fix-rounds`, `--cursor-model`, `--branch`, `--windows-unelevated`, `--in-place`.
 
 ## Troubleshooting
 
 ### Cursor Agent is not recognized
 
-Doctor looks for `%LOCALAPPDATA%\cursor-agent\agent.cmd` or the newest `versions\<ver>\cursor-agent.cmd`. PATH is not required. Install Cursor Agent CLI, then run `npm run doctor` and `npm run cursor-test`.
+Confirm `%LOCALAPPDATA%\cursor-agent\agent.cmd` or `versions\<ver>\cursor-agent.cmd`. PATH is optional. Then `npm run doctor` and `npm run cursor-test`.
 
 ### Workspace Trust Required
 
-Cursor Agent may refuse untrusted directories. For orchestrator-managed isolated worktrees, the Cursor worker may pass `--trust` only after verifying the path is this run's folder under orchestrator `worktrees/`. Do not enable global `--yolo`. Arbitrary directories are not auto-trusted.
+`--trust` is passed only for a verified orchestrator worktree under `worktrees/<run-id>`. Do not enable global `--yolo`. Arbitrary directories are not auto-trusted.
 
 ### Dirty repository
 
@@ -317,42 +291,44 @@ Cursor Agent may refuse untrusted directories. For orchestrator-managed isolated
 git status --short
 ```
 
-Commit or stash your own changes first. The orchestrator never automatically resets user changes.
+Commit or stash first. The orchestrator never automatically resets user changes.
 
 ### Repository has no initial commit
 
-Create an initial Git commit before running a modifying task. Worktrees require a valid `HEAD`.
+Create an initial commit before a modifying task. Worktrees need a valid `HEAD`.
 
-### Worker authentication problems
+### Worker authentication
 
-Run `npm run doctor`, then the individual login/status checks in [Authentication](#authentication).
+`npm run doctor`, then the login/status checks in [Authentication prerequisites](#authentication-prerequisites).
 
-### Antigravity / Gemini issues
+### Antigravity / Gemini
 
-Headless file reads currently require `--dangerously-skip-permissions` because the CLI cannot prompt. v0.8 still runs Gemini only in the isolated worktree, uses `--mode plan --sandbox`, snapshots git status before/after, and rejects the review if files changed. Prompts state that the worker is read-only.
+See [Known limitations](#known-limitations). Isolated worktree, `--mode plan --sandbox`, git snapshot, reject if files changed.
 
 ### Codex Windows sandbox errors
 
-If Codex reports helper/sandbox setup errors on Windows, re-run with `--windows-unelevated`, or run inside WSL2 (WSL2 is not verified as a first-class host for this project).
+Re-run with `--windows-unelevated`. WSL2 is not a validated host for this project.
 
-## Security Notes
+## Security notes
 
 - Tasks may execute code (workers and independent tests).
 - Workers can modify files inside isolated worktrees.
-- Always use Git. Review AI branches before merging.
+- Always use Git. **Review AI-generated branches before merging.**
 - Do not commit secrets, tokens, cookies, or local CLI session files.
-- Avoid broad permission bypasses. `--trust` is limited to verified orchestrator worktrees. Gemini's skip-permissions flag is paired with sandbox, plan mode, and a git change check.
-- The main branch is not automatically merged or pushed.
+- Avoid broad permission bypasses. `--trust` is limited to verified orchestrator worktrees.
+- Main is not automatically merged or pushed.
 
-## Project Status
+## Known limitations
 
-The project is under active development.
-
-Current version: **v0.8.0**
+- Gemini/Antigravity headless review may still require `--dangerously-skip-permissions`, mitigated through sandboxing, isolated worktrees, read-only prompting, and Git change detection.
+- Exact token/dollar cost is not available for all subscription-based workers.
+- AI-generated branches must be reviewed before merging.
+- Windows is the validated platform; macOS/Linux are untested as hosts.
+- There is no automatic GitHub PR, merge, or deploy.
 
 ## Roadmap
 
-Possible future goals (not implemented):
+Not implemented:
 
 - Easier portable installer
 - Linux/macOS validation
@@ -361,17 +337,18 @@ Possible future goals (not implemented):
 - Usage/quota-aware routing
 - Richer policy configuration
 
+## Contributing
+
+1. Fork and branch from `main`.
+2. Keep Windows-first spawning (`shell: false`, argument arrays; wrap `.cmd` via `cmd.exe /d /s /c`).
+3. Run `npm test` (expect 33+ passing) and `npm run doctor`.
+4. Do not commit `runs/`, `worktrees/`, `.env`, credentials, or generated logs.
+5. Open a pull request. Do not push, merge, or deploy from the orchestrator itself.
+
 ## License
 
 This repository does not currently include a license file.
 
-## Contributing
-
-1. Fork the repository and create a branch.
-2. Keep Windows-first process spawning (`shell: false`, argument arrays).
-3. Run `npm test` and `npm run doctor` before opening a pull request.
-4. Do not commit `runs/`, `worktrees/`, `.env`, credentials, or generated logs.
-
 ## Disclaimer
 
-AI-generated code can be wrong, incomplete, or insecure. Review diffs, run the project's tests, and apply your own judgment before deploying anything to production.
+AI-generated code can be wrong, incomplete, or insecure. Review diffs, run the project's tests, and apply your own judgment before production use.

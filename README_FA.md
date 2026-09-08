@@ -1,16 +1,15 @@
 # Multi-Model AI Orchestrator
 
-ارکستراتور محلی چندمدلی برای Cursor. به‌جای انتخاب دستی یک مدل برای هر کار، می‌تواند کار را بین Cursor Agent، OpenAI Codex، Google Gemini از طریق Antigravity، یا گردش‌کار TEAM تقسیم کند.
+ارکستراتور محلی چندمدلی برای Cursor. کار توسعه را بین Cursor Agent، OpenAI Codex، Google Gemini از طریق Antigravity، یا گردش‌کار هماهنگ TEAM مسیر‌دهی می‌کند.
 
-نسخه فعلی: **v0.8.0**
+نسخه فعلی: **v0.8.0**  
+پلتفرم تأییدشده: **Windows**. macOS و Linux به‌عنوان میزبان پشتیبانی‌شده ادعا نمی‌شوند.
 
-## این پروژه چیست
+## پروژه چیست
 
-داخل Cursor، متن کار را یک‌بار می‌دهید. ارکستراتور مسیر مناسب را انتخاب می‌کند، تغییرات Git را در worktree ایزوله نگه می‌دارد، worker را اجرا می‌کند، و برای مسیرهای تغییردهنده تست واقعی پروژهٔ هدف را اجرا می‌کند.
+داخل Cursor متن کار را یک‌بار می‌دهید. ارکستراتور مسیر را انتخاب می‌کند، تغییرات را در Git worktree ایزوله نگه می‌دارد، worker را اجرا می‌کند، و برای مسیرهای تغییردهنده **تست واقعی پروژهٔ هدف** را اجرا می‌کند.
 
-مخزن بازشده در Cursor همان منبع کار است. پوشهٔ این پروژه فقط `runs/` و `worktrees/` را نگه می‌دارد.
-
-پشتیبانی تأییدشده روی **Windows** است. Linux و macOS تأیید نشده‌اند.
+مخزن بازشده منبع کار است. این پوشه `runs/` و `worktrees/` را نگه می‌دارد.
 
 ## معماری
 
@@ -19,7 +18,7 @@ flowchart TD
   chat[Cursor Chat]
   skill["/ai or /ai-team"]
   orch[AI Orchestrator]
-  router[Router]
+  router[Auto Router]
   cursor[CURSOR]
   codex[CODEX]
   gemini[GEMINI]
@@ -36,27 +35,47 @@ TEAM:
 
 `Cursor plan → Codex implement → independent tests → Gemini review`
 
-اگر بررسی `NEEDS_FIXES` بدهد یا تست شکست بخورد، Codex اصلاح می‌کند، تست دوباره اجرا می‌شود، و Gemini دوباره بررسی می‌کند. تعداد دورها محدود است (`--max-fix-rounds`، پیش‌فرض 2). Merge خودکار به main وجود ندارد.
+اگر Gemini بگوید `NEEDS_FIXES` یا تست شکست بخورد:
 
-## Cursor / Codex / Gemini / TEAM
+`Codex fix → tests → Gemini re-review`
 
-| مسیر | کاربرد نمونه |
-| --- | --- |
-| `CURSOR` | UI، CSS، فرانت‌اند، ویرایش سریع |
-| `CODEX` | کدنویسی متمرکز، بک‌اند، باگ، تست |
-| `GEMINI` | تحلیل مخزن، معماری، بررسی، تحقیق read-only |
-| `TEAM` | کار پیچیده/پرریسک: برنامه، پیاده‌سازی، تست، بررسی مستقل |
+تعداد دورها محدود است (`--max-fix-rounds`، پیش‌فرض 2). Merge خودکار به main وجود ندارد.
 
-`--mode` صریح، مسیریابی خودکار را دور می‌زند. `agy` فقط نام قدیمی `gemini` است.
+## Cursor
 
-نمونه‌ها:
+مسیر `CURSOR` از Cursor Agent CLI استفاده می‌کند (مدل پیش‌فرض `auto`). مناسب UI، CSS، فرانت‌اند و ویرایش سریع.
 
 ```text
 /ai Improve the dashboard layout
+```
+
+## Codex
+
+مسیر `CODEX` از Codex CLI به‌صورت `codex exec` استفاده می‌کند. مناسب کدنویسی متمرکز، بک‌اند، باگ و تست.
+
+```text
 /ai Fix the registration validation bug and add tests
+```
+
+## Gemini
+
+مسیر `GEMINI` از Antigravity CLI (`agy -p`) برای تحلیل، معماری و بررسی read-only استفاده می‌کند. اگر فایل تغییر کند، اجرا به‌عنوان نقض ایمنی رد می‌شود.
+
+```text
 /ai Analyze this repository and identify maintainability issues
+```
+
+در حالت headless ممکن است `--dangerously-skip-permissions` لازم باشد؛ کاهش ریسک با sandbox، worktree ایزوله، prompt فقط‌خواندنی و تشخیص تغییر Git انجام می‌شود.
+
+## TEAM
+
+کار پیچیده یا پرریسک: برنامه با Cursor، پیاده‌سازی با Codex، تست مستقل، بررسی با Gemini، حلقه اصلاح محدود.
+
+```text
 /ai-team Refactor authentication across the application and add tests
 ```
+
+`--mode` صریح، Auto Router را دور می‌زند و confidence را ۱۰۰٪ می‌گذارد. `agy` نام قدیمی `gemini` است.
 
 ## نصب
 
@@ -69,81 +88,83 @@ npm run doctor
 
 پیش‌نیازها: Windows، Git، Node.js 20+، npm، Cursor، Cursor Agent CLI، Codex CLI، Antigravity CLI.
 
-## احراز هویت ابزارها
+## احراز هویت
 
-ارکستراتور کلید API داخل این مخزن ذخیره نمی‌کند.
+کلید API داخل این مخزن ذخیره نمی‌شود.
 
 - Codex: `codex login` سپس `codex login status`
-- Antigravity / Gemini: ورود به Antigravity، سپس `agy models` باید بدون تغییر فایل موفق شود
-- Cursor Agent: اجرای `login` روی `agent.cmd` کشف‌شده، سپس `status`
+- Antigravity / Gemini: ورود به Antigravity، سپس `agy models` بدون تغییر فایل
+- Cursor Agent: `login` روی `agent.cmd` کشف‌شده، سپس `status`
 
 کشف Cursor Agent از `%LOCALAPPDATA%\cursor-agent\` است و به PATH وابسته نیست.
 
-## نصب Skillها
+## npm run doctor
+
+بررسی فقط‌خواندنی نسخه ابزارها، احراز هویت، timeoutها و مسیرهای `worktrees/` و `runs/`.
+
+```powershell
+npm run doctor
+```
+
+## نصب /ai و /ai-team
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install-cursor-skills.ps1
 ```
 
-Skillها در `%USERPROFILE%\.cursor\skills\` نصب می‌شوند و به همین clone اشاره می‌کنند. Cursor را Restart یا Reload کنید.
+Skillها در `%USERPROFILE%\.cursor\skills\` نوشته می‌شوند و به همین clone اشاره می‌کنند. Cursor را Restart یا Reload کنید. پروژه‌ای را باز کنید که می‌خواهید روی آن کار شود، نه لزوماً مخزن ارکستراتور.
 
-پروژه‌ای را باز کنید که می‌خواهید روی آن کار شود، نه لزوماً مخزن ارکستراتور.
+## نحوه استفاده
 
-## استفاده از /ai
-
-`/ai` با `--mode auto` اجرا می‌شود. روتر بین CURSOR، CODEX، GEMINI و TEAM انتخاب می‌کند.
-
-```text
-/ai Fix the registration validation bug and add tests
-```
-
-## استفاده از /ai-team
-
-`/ai-team` همیشه `--mode team` است.
-
-```text
-/ai-team Refactor authentication across the application and add tests
-```
-
-اجرای دستی:
+- `/ai` = `--mode auto` (روتر بین CURSOR، CODEX، GEMINI، TEAM انتخاب می‌کند)
+- `/ai-team` = `--mode team`
 
 ```powershell
 npm run task -- --repo "C:\Projects\my-app" --mode auto --commit-on-pass --task "Fix the login bug and add tests"
 ```
 
-حالت‌ها: `auto`، `cursor`، `codex`، `gemini`، `team`، و `agy` (سازگاری قدیمی).
+حالت‌ها: `auto`، `cursor`، `codex`، `gemini`، `team`، `agy`.
 
 ## Git isolation
 
-- کارهای تغییردهنده در worktree ایزوله زیر `worktrees/` اجرا می‌شوند.
+- کارهای تغییردهنده در worktree زیر `worktrees/` اجرا می‌شوند.
 - workspace اصلی باید تمیز بماند.
-- اگر مخزن کثیف باشد اجرا رد می‌شود. ارکستراتور فایل‌های شما را reset یا پاک نمی‌کند.
-- برای worktree حداقل یک commit اولیه لازم است.
+- مخزن کثیف رد می‌شود. ارکستراتور فایل‌های شما را reset یا پاک نمی‌کند.
+- حداقل یک commit اولیه لازم است.
 - شاخه‌ها معمولاً `ai/<run-id>` هستند.
 - merge یا push خودکار وجود ندارد.
-- worktree موفق به‌صورت پیش‌فرض حذف می‌شود؛ worktree ناموفق برای دیباگ نگه داشته می‌شود.
+- قبل از merge، شاخهٔ تولیدشده توسط AI را بررسی کنید.
 
-## تست
+## تست مستقل
+
+پس از پیاده‌سازی CURSOR/CODEX/TEAM، دستور تست واقعی پروژه در worktree اجرا می‌شود. PASS/FAIL از exit code است، نه ادعای agent. تشخیص: `npm test`، `php artisan test`، Flutter/Dart، Cargo، Go، .NET، pytest. اگر چیزی پیدا نشود: `SKIP` (موفقیت نیست). FAIL مانع commit می‌شود.
 
 ```powershell
 npm test
 npm run cursor-test
 npm run agy-test
-npm run doctor
-npm run cleanup
 ```
 
-`npm test` منطق داخلی را بدون فراخوانی سرویس خارجی پوشش می‌دهد. `cursor-test` و `agy-test` به احراز هویت واقعی worker نیاز دارند.
+`npm test` منطق داخلی را پوشش می‌دهد (حداقل ۳۳ تست). `cursor-test` و `agy-test` به احراز هویت واقعی نیاز دارند.
+
+## cleanup
+
+```powershell
+npm run cleanup
+npm run cleanup -- --apply --older-than-days 7
+```
+
+پیش‌فرض dry-run است. worktree موفق معمولاً با `git worktree remove` پاک می‌شود مگر `AI_KEEP_SUCCESS_WORKTREES=true`. worktree ناموفق به‌صورت پیش‌فرض برای دیباگ می‌ماند.
 
 ## عیب‌یابی
 
 ### Cursor Agent شناخته نمی‌شود
 
-مسیر `%LOCALAPPDATA%\cursor-agent\agent.cmd` یا `versions\<ver>\cursor-agent.cmd` را بررسی کنید. PATH لازم نیست.
+`%LOCALAPPDATA%\cursor-agent\agent.cmd` یا `versions\<ver>\cursor-agent.cmd` را بررسی کنید. سپس `npm run doctor`.
 
 ### Workspace Trust Required
 
-`--trust` فقط برای worktree تأییدشدهٔ ارکستراتور اعمال می‌شود. `--yolo` سراسری توصیه نمی‌شود.
+`--trust` فقط برای worktree تأییدشدهٔ ارکستراتور است. `--yolo` سراسری توصیه نمی‌شود.
 
 ### مخزن کثیف
 
@@ -153,26 +174,27 @@ git status --short
 
 تغییرات خود را commit یا stash کنید. ارکستراتور تغییرات کاربر را خودکار دور نمی‌ریزد.
 
-### مخزن بدون commit اولیه
+### بدون commit اولیه
 
-قبل از ساخت worktree یک commit اولیه بسازید.
+قبل از worktree یک commit اولیه بسازید.
 
-### مشکل احراز هویت
+### احراز هویت
 
-`npm run doctor` و دستورهای login/status هر CLI را اجرا کنید.
+`npm run doctor` و login/status هر CLI.
 
-### Antigravity / Gemini
+### Gemini / Antigravity
 
-Gemini در worktree ایزوله، با `--mode plan --sandbox` اجرا می‌شود. اگر فایل تغییر کند بررسی رد می‌شود.
+worktree ایزوله، `--mode plan --sandbox`، رد شدن در صورت تغییر فایل.
 
 ## نکات امنیتی
 
 - تسک‌ها ممکن است کد اجرا کنند.
-- workerها می‌توانند داخل worktree فایل را تغییر دهند.
-- همیشه از Git استفاده کنید و شاخهٔ AI را قبل از merge بررسی کنید.
+- workerها داخل worktree می‌توانند فایل را تغییر دهند.
+- همیشه Git؛ شاخهٔ AI را قبل از merge بررسی کنید.
 - secret، token و فایل نشست را commit نکنید.
 - bypass گستردهٔ مجوز توصیه نمی‌شود.
-- شاخهٔ main به‌صورت خودکار merge نمی‌شود.
+- هزینهٔ دقیق token/دلار برای همهٔ workerهای اشتراکی در دسترس نیست.
+- main به‌صورت خودکار merge نمی‌شود.
 
 ## پیکربندی
 
@@ -180,8 +202,8 @@ Gemini در worktree ایزوله، با `--mode plan --sandbox` اجرا می�
 
 ## وضعیت پروژه
 
-در حال توسعه فعال. نسخه فعلی v0.8.0. این مخزن فعلاً فایل License ندارد.
+در حال توسعه فعال. نسخه v0.8.0. این مخزن فعلاً فایل License ندارد.
 
 ## سلب مسئولیت
 
-کد تولیدشده توسط AI باید قبل از استقرار در محیط واقعی بررسی و تست شود.
+کد تولیدشده توسط AI باید قبل از استقرار واقعی بررسی و تست شود.

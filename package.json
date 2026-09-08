@@ -2,7 +2,7 @@
   "name": "multi-model-ai-orchestrator",
   "version": "0.8.0",
   "private": true,
-  "description": "A local multi-model coding orchestrator for Cursor that routes development tasks between Cursor Agent, OpenAI Codex, Google Gemini/Antigravity, or a coordinated multi-agent team workflow.",
+  "description": "A local multi-model coding orchestrator for Cursor that routes development tasks between Cursor Agent, OpenAI Codex, Google Gemini/Antigravity, or a coordinated multi-agent team.",
   "type": "module",
   "repository": {
     "type": "git",
