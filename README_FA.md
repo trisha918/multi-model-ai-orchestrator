@@ -60,7 +60,7 @@ ai-orchestrator uninstall-skills
 
 ## نصب و حذف
 
-`.\install.ps1` تکرارپذیر است: Git/Node/npm را بررسی می‌کند، وابستگی‌ها را نصب می‌کند، با `npm link` دستور `ai-orchestrator` را سراسری می‌کند، Skillها را می‌نویسد و doctor را اجرا می‌کند.
+`.\install.ps1` تکرارپذیر است: Git/Node/npm را بررسی می‌کند، وابستگی‌ها را نصب می‌کند، با `npm link` دستور `ai-orchestrator` را سراسری می‌کند، در صورت نیاز `%APPDATA%\npm` را **یک‌بار** به PATH کاربر اضافه می‌کند (PATH سیستم را تغییر نمی‌دهد)، Skillها را می‌نویسد و doctor را اجرا می‌کند.
 
 Cursor، Codex، Antigravity، Git و Node را **خودکار نصب نمی‌کند**. اگر نباشند، پیام MISSING و راهنمای نصب موجود را نشان می‌دهد.
 
@@ -78,19 +78,20 @@ Cursor، Codex، Antigravity، Git و Node را **خودکار نصب نمی‌�
 
 `AI_CURSOR_MODEL`، `AI_CODEX_MODEL`، `AI_GEMINI_MODEL`
 
-## انتخاب مدل
+## Skillهای Cursor (v1.0)
 
 | دستور | کارگر | مدل |
 | --- | --- | --- |
 | `/ai` | کارگر خودکار | مدل خودکار |
 | `/ai-team` | TEAM | مدل خودکار در هر مرحله |
-| `/ai-codex` | Codex | مدل خودکار Codex |
+| `/ai-cursor` | CURSOR | مدل هوشمند Cursor |
+| `/ai-codex` | Codex | مدل هوشمند Codex |
 | `/ai-codex-sol` | Codex | دستی: alias فعلی Sol |
-| `/ai-gemini` | Gemini | مدل خودکار Gemini |
+| `/ai-gemini` | Gemini | مدل هوشمند Gemini |
 | `/ai-gemini-pro-high` | Gemini | دستی: Pro High فعلی |
-| `/ai-models` | — | فهرست مدل‌های کشف‌شده |
+| `/ai-models` | — | نمایش مدل‌های کشف‌شده |
 
-AUTO می‌تواند به سطح قابلیت بعدی برگردد. MANUAL اگر مدل موجود نباشد شکست می‌خورد و مدل دیگری را بی‌صدا جایگزین نمی‌کند. aliasها شماره نسخه ندارند تا نسل فعلی را پیدا کنند؛ شناسهٔ دقیق همیشه در خروجی و `models.json` ثبت می‌شود.
+AUTO می‌تواند به سطح قابلیت بعدی برگردد. MANUAL اگر مدل موجود نباشد شکست می‌خورد و مدل دیگری را بی‌صدا جایگزین نمی‌کند. شناسهٔ دقیق همیشه در خروجی و `models.json` ثبت می‌شود.
 
 `ai-orchestrator config show` / `config path` / `config set defaultMode auto`
 
@@ -102,7 +103,7 @@ AUTO می‌تواند به سطح قابلیت بعدی برگردد. MANUAL ا
 
 ## به‌روزرسانی
 
-دستور `ai-orchestrator update` در v0.9 وجود ندارد.
+دستور `ai-orchestrator update` در v1.0 وجود ندارد.
 
 ```powershell
 git pull
@@ -128,7 +129,7 @@ npm install
 
 ## مسیرها و عیب‌یابی
 
-اگر `ai-orchestrator` شناخته نشد، پوشهٔ npm global (معمولاً `%APPDATA%\npm`) را به PATH اضافه کنید و ترمینال را از نو باز کنید. `.\install.ps1` شیم PowerShell را هم با `@args` جایگزین می‌کند تا آرگومان‌ها به یک رشته تبدیل نشوند.
+اگر `ai-orchestrator` شناخته نشد، `.\install.ps1` پوشهٔ npm global (معمولاً `%APPDATA%\npm`) را در صورت نبودن به PATH کاربر اضافه می‌کند. ترمینال جدید باید بدون تنظیم دستی کار کند. `.\install.ps1` شیم PowerShell را هم با `@args` جایگزین می‌کند تا آرگومان‌ها به یک رشته تبدیل نشوند.
 
 مخزن کثیف رد می‌شود؛ ارکستراتور reset خودکار نمی‌کند. بدون commit اولیه worktree ساخته نمی‌شود.
 

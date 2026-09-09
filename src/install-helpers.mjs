@@ -29,6 +29,21 @@ export function pathHasDirectory(pathEnv, directory) {
   return parts.some(p => norm(p) === nNeedle);
 }
 
+export function appendUniquePathEntry(existing, directory) {
+  if (!directory || !String(directory).trim()) {
+    return { value: existing || '', added: false };
+  }
+  if (pathHasDirectory(existing, directory)) {
+    return { value: existing || '', added: false };
+  }
+  const dir = String(directory).replace(/[\\/]+$/, '');
+  const cur = String(existing || '').trim();
+  return {
+    value: cur ? `${cur}${path.delimiter}${dir}` : dir,
+    added: true,
+  };
+}
+
 export function readPackageManifest() {
   return JSON.parse(readFileSync(path.join(packageRoot(), 'package.json'), 'utf8'));
 }

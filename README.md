@@ -130,11 +130,21 @@ Do not invoke `node src/orchestrator.mjs` as the normal user entry point.
 1. Checks PowerShell, Git, Node.js (must satisfy `package.json` `engines.node`, currently `>=20`), and npm
 2. Runs `npm install` in the clone
 3. Runs `npm link` so `ai-orchestrator` is on the npm global bin
-4. Verifies `ai-orchestrator version`
-5. Detects Cursor Agent, Codex, and Antigravity (does **not** install them)
-6. Installs global `/ai` and `/ai-team` skills
-7. Runs `ai-orchestrator doctor`
-8. Prints a setup summary
+4. If `%APPDATA%\npm` (or `npm prefix -g`) is missing from the **current user** PATH, adds it once. It does not change the system PATH, does not duplicate entries, and does not overwrite other PATH values. The current PowerShell session is updated immediately.
+5. Verifies `ai-orchestrator version`
+6. Detects Cursor Agent, Codex, and Antigravity (does **not** install them)
+7. Installs global Cursor skills (`/ai`, `/ai-team`, worker, profile, and discovered alias skills)
+8. Runs `ai-orchestrator doctor`
+9. Prints a setup summary
+
+When User PATH is updated, the installer prints:
+
+```text
+Global npm bin added to User PATH:
+C:\Users\<user>\AppData\Roaming\npm
+```
+
+A newly opened terminal should then recognize `ai-orchestrator` without manual PATH edits.
 
 The installer never silently installs Cursor, Cursor Agent, Codex, Antigravity, Git, or Node. Missing tools are reported with an actionable hint.
 
@@ -169,11 +179,29 @@ They call `ai-orchestrator`, never `C:\some\clone\scripts\run-task.ps1`.
 
 `/ai-team <task>` is the same with `--mode team`.
 
-`/ai-cursor`, `/ai-codex`, and `/ai-gemini` force that worker with **automatic model** selection.
+## Cursor skills (v1.0)
 
-`/ai-models` is read-only and does not need a Git project: `ai-orchestrator models`.
+| Command | Worker | Model |
+| --- | --- | --- |
+| `/ai` | AUTO worker | AUTO model |
+| `/ai-team` | TEAM | AUTO per-stage models |
+| `/ai-cursor` | CURSOR | smart Cursor model |
+| `/ai-codex` | CODEX | smart Codex model |
+| `/ai-codex-sol` | CODEX | manual Sol alias (current verified Sol-family id) |
+| `/ai-gemini` | GEMINI | smart Gemini model |
+| `/ai-gemini-pro-high` | GEMINI | manual Pro High alias (current verified Pro High id) |
+| `/ai-models` | (none) | Show currently detected model choices |
 
-Task text is **not** passed as `--task` from Cursor skills, so Windows PowerShell cannot strip embedded quotes. Manual CLI use may still pass `--task` (or `--task-stdin`). Skills delete only the inbox file they created.
+Also installed when the local registry can resolve them: Codex profiles `/ai-codex-fast|balanced|strong|max`, Gemini profiles `/ai-gemini-fast|balanced|strong|max`, and aliases such as `/ai-codex-luna`, `/ai-codex-terra`, `/ai-gemini-flash-high`.
+
+**AUTO vs MANUAL**
+
+- **Automatic** model selection may fall back to another available capability tier (`max` → `strong` → …) and logs Preferred / Resolved / Reason.
+- **Manual** model selection (explicit `--model`, `--model-id`, skill alias, or non-`auto` config/env) **never silently falls back**. If the requested model is unavailable, the run fails with `REQUESTED MODEL UNAVAILABLE`.
+
+The exact resolved model id is always printed in the banner and written to `models.json` in the run log.
+
+Task text is **not** passed as `--task` from Cursor skills (UTF-8 `--task-file` inbox, no BOM). Manual CLI use may still pass `--task` (or `--task-stdin`). Skills delete only the inbox file they created.
 
 Task input is exclusive: `--task`, `--task-file`, and `--task-stdin` cannot be combined.
 
@@ -307,25 +335,9 @@ Explicit `--mode cursor|codex|gemini|agy|team` overrides the auto router and rep
 
 ## MODEL SELECTION
 
-v1.0 adds **smart model routing** and **manual model overrides** on top of worker routing. Short aliases do **not** include version numbers, so they map to the currently available generation. The exact resolved model id is always printed and written to `models.json` in the run log.
+v1.0 adds **smart model routing** and **manual model overrides** on top of worker routing. Short aliases do **not** include version numbers, so they map to the currently available generation.
 
-| Skill / CLI | Worker | Model |
-| --- | --- | --- |
-| `/ai` | AUTO WORKER | AUTO MODEL |
-| `/ai-team` | TEAM | AUTO MODEL PER STAGE |
-| `/ai-cursor` | FORCE CURSOR | AUTO CURSOR MODEL |
-| `/ai-codex` | FORCE CODEX | AUTO CODEX MODEL |
-| `/ai-gemini` | FORCE GEMINI | AUTO GEMINI MODEL |
-| `/ai-codex-sol` | FORCE CODEX | MANUAL alias `sol` → current verified Sol-family id |
-| `/ai-gemini-pro-high` | FORCE GEMINI | MANUAL alias `pro-high` → current verified Pro High id |
-| `/ai-models` | (none) | Lists discovered models |
-
-**AUTO vs MANUAL**
-
-- AUTO (smart router) may fall back to the next available capability tier (`max` → `strong` → …) and logs Preferred / Resolved / Reason.
-- MANUAL (explicit `--model`, `--model-id`, skill alias, or non-`auto` config/env) **never** silently switches to another model. If `sol` is unavailable the run fails with `REQUESTED MODEL UNAVAILABLE`.
-
-Stable profiles: `auto`, `fast`, `balanced`, `strong`, `max`. Profiles are not model ids.
+See the skill table above. Stable profiles: `auto`, `fast`, `balanced`, `strong`, `max`. Profiles are not model ids.
 
 ```powershell
 ai-orchestrator run --mode codex --model auto --task-file $taskFile
@@ -391,7 +403,7 @@ Only run-id-shaped folders under the managed runs/worktrees roots are considered
 
 ### `ai-orchestrator` is not recognized
 
-`npm link` installs a shim under the npm global prefix (often `%APPDATA%\npm`). Add that folder to your user PATH and **open a new terminal**. Then `ai-orchestrator version`.
+`npm link` installs a shim under the npm global prefix (often `%APPDATA%\npm`). `.\install.ps1` adds that folder to the **current user** PATH if it is missing, and also updates the current session. After a successful install, open a new terminal and run `ai-orchestrator version`.
 
 `.\install.ps1` also replaces npm's default `ai-orchestrator.ps1` with an argument-safe shim (`@args`). Without that, PowerShell can collapse `run --repo ...` into one argument. Re-run `.\install.ps1` if a new `npm link` overwrote the shim.
 

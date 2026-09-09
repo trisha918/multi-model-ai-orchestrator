@@ -19,6 +19,8 @@ ehthumbs.db
 .env
 .env.*
 !.env.example
+models-cache.json
+**/models-cache.json
 *.pem
 *.p12
 *.pfx

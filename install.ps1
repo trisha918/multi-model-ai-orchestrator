@@ -98,18 +98,54 @@ try {
 }
 
 $NpmPrefix = (& npm prefix -g).Trim()
-$pathParts = @($env:Path -split ';' | ForEach-Object { $_.TrimEnd('\') })
-$prefixNorm = $NpmPrefix.TrimEnd('\')
-$onPath = $false
-foreach ($part in $pathParts) {
-  if ($part -and ($part -ieq $prefixNorm)) { $onPath = $true; break }
+$NpmBin = $NpmPrefix
+if (-not $NpmBin -and $env:APPDATA) {
+  $NpmBin = Join-Path $env:APPDATA 'npm'
 }
-if ($NpmPrefix -and -not $onPath) {
+
+function Get-NormalizedPathEntries([string]$PathValue) {
+  if ([string]::IsNullOrWhiteSpace($PathValue)) { return @() }
+  return @(
+    $PathValue -split ';' |
+      ForEach-Object { $_.Trim().TrimEnd('\') } |
+      Where-Object { $_ }
+  )
+}
+
+function Test-PathListContainsDirectory([string]$PathValue, [string]$Directory) {
+  if ([string]::IsNullOrWhiteSpace($Directory)) { return $false }
+  $needle = $Directory.TrimEnd('\')
+  foreach ($part in (Get-NormalizedPathEntries $PathValue)) {
+    if ($part -and ($part -ieq $needle)) { return $true }
+  }
+  return $false
+}
+
+function Add-UserPathDirectory([string]$Directory) {
+  if ([string]::IsNullOrWhiteSpace($Directory)) { return $false }
+  $dir = $Directory.TrimEnd('\')
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if ($null -eq $userPath) { $userPath = '' }
+  if (Test-PathListContainsDirectory $userPath $dir) {
+    return $false
+  }
+  $newUser = if ([string]::IsNullOrWhiteSpace($userPath)) { $dir } else { "$userPath;$dir" }
+  [Environment]::SetEnvironmentVariable('Path', $newUser, 'User')
   Write-Host ''
-  Write-Host "NOTE: npm global prefix is not on PATH in this session:"
-  Write-Host "  $NpmPrefix"
-  Write-Host 'Adding it for this installer session. If `ai-orchestrator` is not recognized later, add that folder to your user PATH and open a new terminal.'
-  $env:Path = "$NpmPrefix;$env:Path"
+  Write-Host 'Global npm bin added to User PATH:'
+  Write-Host $dir
+  return $true
+}
+
+if ($NpmBin) {
+  $addedUser = Add-UserPathDirectory $NpmBin
+  if (-not (Test-PathListContainsDirectory $env:Path $NpmBin)) {
+    $env:Path = "$NpmBin;$env:Path"
+    if (-not $addedUser) {
+      Write-Host ''
+      Write-Host "Added npm global bin to this session PATH: $NpmBin"
+    }
+  }
 }
 
 Write-Host ''

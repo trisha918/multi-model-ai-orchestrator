@@ -5,7 +5,7 @@ import path from 'node:path';
 import { installationInfo, runtimeDirs, packageVersion, userConfigDir } from './paths.mjs';
 import { packageRoot as toolingRoot, VERSION } from './tooling.mjs';
 import { isInsideDir } from './workspace.mjs';
-import { parseNodeEngineMinimum, nodeSatisfiesEngine, pathHasDirectory } from './install-helpers.mjs';
+import { parseNodeEngineMinimum, nodeSatisfiesEngine, pathHasDirectory, appendUniquePathEntry } from './install-helpers.mjs';
 import { planCleanup, applyCleanup } from './cleanup.mjs';
 import { mkdir, mkdtemp, rm, utimes } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -44,7 +44,17 @@ test('installer helpers parse engines and PATH directories with spaces', () => {
   assert.equal(nodeSatisfiesEngine('18.20.0', '>=20'), false);
   const dir = 'C:\\Users\\Test User\\AppData\\Roaming\\npm';
   assert.equal(pathHasDirectory(`${dir};C:\\Windows`, dir), true);
+  assert.equal(pathHasDirectory(`${dir}\\;C:\\Windows`, dir), true);
   assert.equal(pathHasDirectory('C:\\Windows', dir), false);
+  const first = appendUniquePathEntry('C:\\Windows', dir);
+  assert.equal(first.added, true);
+  assert.match(first.value, /npm/);
+  const second = appendUniquePathEntry(first.value, dir);
+  assert.equal(second.added, false);
+  assert.equal(second.value, first.value);
+  const fromEmpty = appendUniquePathEntry('', dir);
+  assert.equal(fromEmpty.added, true);
+  assert.equal(fromEmpty.value, dir);
 });
 
 test('cleanup refuses paths outside managed runtime roots', async () => {

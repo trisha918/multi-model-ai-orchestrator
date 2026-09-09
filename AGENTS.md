@@ -12,5 +12,8 @@ This repository is the Multi-Model AI Orchestrator. Keep Windows native support 
 - Do not commit `runs/`, `worktrees/`, `.env`, credentials, tokens, or local CLI session files.
 - Do not hard-code a developer's personal machine paths into source or documentation intended for other users.
 - After v0.9, users invoke `ai-orchestrator` globally. Cursor skills must call that command, never an absolute clone path.
-- Cursor skills must pass task text via `--task-file` (UTF-8 temp inbox file), never as `--task` through PowerShell native quoting.
-- Configuration precedence: CLI argument → environment variable → user config → built-in default.
+- Cursor skills must pass task text via `--task-file` (UTF-8 without BOM temp inbox file), never as `--task` through PowerShell native quoting.
+- Configuration precedence: CLI argument → environment variable → user config → smart auto → built-in default.
+- Manual model selection never silently falls back. Automatic model selection may fall back to another available capability tier. Always log the exact resolved model id.
+- TEAM stages (Cursor plan, Codex implement, independent tests, Gemini review, Codex fix, re-review) must use the same verified isolated worktree. Gemini review is pinned with explicit cwd, `--add-dir`, and `--new-project`.
+- `.\install.ps1` must persist the npm global bin (`%APPDATA%\npm`) on the **user** PATH if missing (no system PATH edits, no duplicates). Generated fixtures must be UTF-8 without BOM.
