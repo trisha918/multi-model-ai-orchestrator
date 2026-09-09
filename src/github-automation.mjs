@@ -81,6 +81,31 @@ export function decideTrigger({
   return { action: 'start', reason: 'trusted ai-auto' };
 }
 
+export async function readGithubCiStatus({ client, owner, name, state }) {
+  let ref = state?.commitSha || state?.branch || '';
+  if (state?.prNumber && typeof client.getPullRequest === 'function') {
+    try {
+      const pr = await client.getPullRequest(owner, name, state.prNumber);
+      ref = pr?.head?.sha || ref;
+    } catch {
+      /* use commit/branch already on state */
+    }
+  }
+  let runs = [];
+  if (typeof client.getChecks === 'function' && ref) {
+    const data = await client.getChecks(owner, name, ref);
+    runs = data?.check_runs || (Array.isArray(data) ? data : []);
+  }
+  const classified = classifyCheckRuns(runs, { now: Date.now() });
+  if (classified.status === CI_STATUS.PASS) {
+    return { githubCi: 'PASS', stage: 'READY_FOR_HUMAN_MERGE', summary: classified.summary || '' };
+  }
+  if (classified.status === CI_STATUS.FAIL) {
+    return { githubCi: 'FAIL', stage: 'FAILED', summary: classified.summary || '' };
+  }
+  return { githubCi: 'UNKNOWN', stage: 'WAITING_FOR_CI', summary: classified.summary || '' };
+}
+
 function dryLog(plan, message, extra = {}) {
   plan.steps.push({ message, ...extra, write: false });
 }
@@ -365,7 +390,11 @@ export async function runIssueAutomation({
       if (!dryRun) state = await saveIssueState(state, env);
     }
 
-    const resumeLocalTests = skipGitPush || (
+    const resumeWaitingForCi = decision.action === 'resume'
+      && state.stage === 'WAITING_FOR_CI'
+      && Boolean(state.prNumber);
+
+    const resumeLocalTests = skipGitPush || resumeWaitingForCi || (
       decision.action === 'resume'
       && state.stage === 'LOCAL_TESTS'
       && (state.localTests === 'PASS' || state.localTests === 'SKIP')
@@ -533,6 +562,41 @@ export async function runIssueAutomation({
       if (pushed.crashed) {
         return { code: 1, crashed: true, plan, state };
       }
+    }
+
+    if (resumeWaitingForCi) {
+      const sync = await readGithubCiStatus({ client, owner, name, state });
+      state.githubCi = sync.githubCi;
+      state.stage = sync.stage;
+      if (sync.githubCi === 'FAIL') state.lastFailure = sync.summary || 'GitHub CI failed';
+      if (sync.githubCi === 'PASS') {
+        state.lastFailure = '';
+        state.pullRequestAutoMerged = false;
+        state.published = false;
+      }
+      state = await saveIssueState(state, env);
+      await applyLabels(client, { owner, name, issueNumber, issue, stage: state.stage, dryRun, plan });
+      if (state.stage === 'READY_FOR_HUMAN_MERGE') {
+        state = await upsertStatus(client, {
+          owner, name, issueNumber, state, dryRun, plan,
+          body: formatStatusComment({
+            headline: MILESTONE_HEADLINES.READY_FOR_HUMAN_MERGE,
+            localTests: state.localTests,
+            githubCi: 'PASS',
+            review: state.review || 'PASS',
+            attempt: state.attempt,
+            maxAttempts: state.maxAttempts,
+          }),
+        });
+        state = await saveIssueState(state, env);
+      }
+      return {
+        code: state.stage === 'FAILED' ? 1 : 0,
+        plan,
+        state,
+        decision,
+        waiting: state.stage === 'WAITING_FOR_CI',
+      };
     }
 
     state.stage = 'WAITING_FOR_CI';

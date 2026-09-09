@@ -312,7 +312,8 @@ export function createMemoryGithubClient(seed = {}) {
       });
     },
     async getChecks(owner, name, ref) {
-      const runs = checksByRef[ref] || [];
+      log.push({ op: 'getChecks', ref });
+      const runs = checksByRef[ref] || checksByRef[String(ref)] || [];
       return { check_runs: runs };
     },
     async getCombinedStatus() {

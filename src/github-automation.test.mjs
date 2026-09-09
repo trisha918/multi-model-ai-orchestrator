@@ -836,3 +836,175 @@ test('assisted run never requests a force push', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('WAITING_FOR_CI with successful checks becomes READY_FOR_HUMAN_MERGE', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const branch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: {
+      checks: {
+        [commit]: [{ name: 'test', status: 'completed', conclusion: 'success' }],
+      },
+      pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #6', issueNumber: 6 }],
+    },
+  }));
+  let implCalls = 0;
+  let pushCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      githubCi: 'UNKNOWN',
+      localTests: 'PASS',
+      commitSha: commit,
+      branch,
+      mode: 'assisted',
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('must not re-implement while waiting for CI');
+      },
+      gitPush: async () => {
+        pushCalls += 1;
+        throw new Error('must not push while waiting for CI');
+      },
+      waitForCi: async () => {
+        throw new Error('resume CI sync should use GitHub checks, not the live waiter');
+      },
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(pushCalls, 0);
+    assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 0);
+    assert.equal(result.state.githubCi, 'PASS');
+    assert.equal(result.state.stage, 'READY_FOR_HUMAN_MERGE');
+    assert.equal(result.state.prNumber, 7);
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.stage, 'READY_FOR_HUMAN_MERGE');
+    assert.equal(saved.githubCi, 'PASS');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('WAITING_FOR_CI with failed checks becomes FAILED', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const branch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: {
+      checks: {
+        [commit]: [{ name: 'test', status: 'completed', conclusion: 'failure' }],
+      },
+      pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #6', issueNumber: 6 }],
+    },
+  }));
+  let implCalls = 0;
+  let pushCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      githubCi: 'UNKNOWN',
+      localTests: 'PASS',
+      commitSha: commit,
+      branch,
+      mode: 'assisted',
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('must not re-implement on CI fail sync');
+      },
+      gitPush: async () => {
+        pushCalls += 1;
+        throw new Error('must not push on CI fail sync');
+      },
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(pushCalls, 0);
+    assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 0);
+    assert.equal(result.state.githubCi, 'FAIL');
+    assert.equal(result.state.stage, 'FAILED');
+    assert.equal(result.code, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('WAITING_FOR_CI with pending checks stays WAITING_FOR_CI', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const branch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: {
+      checks: {
+        [commit]: [{ name: 'test', status: 'in_progress', conclusion: null }],
+      },
+      pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #6', issueNumber: 6 }],
+    },
+  }));
+  let implCalls = 0;
+  let pushCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      githubCi: 'UNKNOWN',
+      localTests: 'PASS',
+      commitSha: commit,
+      branch,
+      mode: 'assisted',
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('must not re-implement while CI pending');
+      },
+      gitPush: async () => {
+        pushCalls += 1;
+        throw new Error('must not push while CI pending');
+      },
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(pushCalls, 0);
+    assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 0);
+    assert.equal(result.state.stage, 'WAITING_FOR_CI');
+    assert.equal(result.state.githubCi, 'UNKNOWN');
+    assert.equal(result.state.prNumber, 7);
+    assert.equal(result.waiting, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
