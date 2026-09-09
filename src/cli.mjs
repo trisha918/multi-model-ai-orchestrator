@@ -13,8 +13,10 @@ import {
 } from './config.mjs';
 import { userConfigPath, installationInfo } from './paths.mjs';
 import { installSkills, uninstallSkills } from './skills.mjs';
+import { loadRegistry } from './model-cache.mjs';
+import { formatModelsReport } from './model-registry.mjs';
 
-export const COMMANDS = ['doctor', 'version', 'run', 'cleanup', 'config', 'install-skills', 'uninstall-skills'];
+export const COMMANDS = ['doctor', 'version', 'run', 'cleanup', 'config', 'install-skills', 'uninstall-skills', 'models'];
 
 export function printVersion() {
   return `Multi-Model AI Orchestrator v${VERSION}`;
@@ -49,6 +51,9 @@ export function parseCli(argv) {
   if (command === 'cleanup') return { command: 'cleanup', argv: rest, flags: {} };
   if (command === 'install-skills') return { command: 'install-skills', argv: rest, flags: {} };
   if (command === 'uninstall-skills') return { command: 'uninstall-skills', argv: rest, flags: {} };
+  if (command === 'models') {
+    return { command: 'models', argv: rest, refresh: rest[0] === 'refresh' };
+  }
   if (command === 'config') {
     const sub = rest[0] || 'show';
     return {
@@ -75,15 +80,16 @@ export function helpText() {
     '  ai-orchestrator <command>',
     '',
     'Commands:',
-    '  doctor              Check tools, auth, skills, config, and runtime paths',
+    '  doctor              Check tools, auth, skills, config, runtime paths, and model discovery',
     '  version             Print the package version',
     '  run                 Run a task (same flags as npm run task)',
+    '  models              Show discovered models (use `models refresh` to re-query CLIs)',
     '  cleanup             List or delete old runs/worktrees (dry-run unless --apply)',
     '  config show         Show effective configuration',
     '  config path         Print the user config.json path',
     '  config set <k> <v>  Write a validated user setting',
-    '  install-skills      Install global /ai and /ai-team Cursor skills',
-    '  uninstall-skills    Remove project-owned /ai and /ai-team skills',
+    '  install-skills      Install global Cursor skills (/ai, /ai-team, worker, profile, alias)',
+    '  uninstall-skills    Remove project-owned Cursor skills',
     '',
     'Run flags:',
     '  --repo <git-root>   Target repository (defaults to Git root of the current directory)',
@@ -91,11 +97,15 @@ export function helpText() {
     '  --task-file <path>  Read task as UTF-8 from a file (Cursor skills use this)',
     '  --task-stdin        Read task as UTF-8 from stdin',
     '  --mode auto|cursor|codex|gemini|agy|team',
-    '  --commit-on-pass    --cursor-model --max-fix-rounds --branch --in-place --windows-unelevated',
+    '  --model <alias|profile>   Friendly alias or profile (auto, fast, sol, pro-high, ...)',
+    '  --model-id <id>     Exact provider model id (do not combine with --model)',
+    '  --cursor-model --codex-model --gemini-model   Per-worker aliases',
+    '  --commit-on-pass --max-fix-rounds --branch --in-place --windows-unelevated',
     '',
     `Config precedence: ${CONFIG_PRECEDENCE.join(' → ')}`,
+    'Model env overrides: AI_CURSOR_MODEL, AI_CODEX_MODEL, AI_GEMINI_MODEL',
     '',
-    'There is no ai-orchestrator update in v0.9. To update a Git clone:',
+    'There is no ai-orchestrator update in v1.0. To update a Git clone:',
     '  git pull',
     '  npm install',
     '  .\\install.ps1',
@@ -119,6 +129,9 @@ async function cmdConfig(parsed) {
       effective: {
         defaultMode: effective.defaultMode,
         cursorModel: effective.cursorModel,
+        codexModel: effective.codexModel,
+        geminiModel: effective.geminiModel,
+        team: effective.team,
         keepSuccessWorktrees: effective.keepSuccessWorktrees,
         keepFailedWorktrees: effective.keepFailedWorktrees,
         workerMaxRetries: effective.workerMaxRetries,
@@ -180,14 +193,33 @@ export async function main(argv = process.argv.slice(2)) {
   if (parsed.command === 'config') {
     return cmdConfig(parsed);
   }
+  if (parsed.command === 'models') {
+    try {
+      const loaded = await loadRegistry({ refresh: Boolean(parsed.refresh) });
+      console.log(formatModelsReport(loaded.registry));
+      console.log('');
+      console.log(parsed.refresh ? 'Refreshed from installed CLIs.' : (loaded.fromCache ? `Cache: ${loaded.path}${loaded.stale ? ' (stale)' : ''}` : `Wrote cache: ${loaded.path}`));
+      return 0;
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      return 1;
+    }
+  }
   if (parsed.command === 'install-skills') {
-    const results = await installSkills();
+    let registry = null;
+    try {
+      registry = (await loadRegistry({ refresh: false })).registry;
+    } catch {
+      registry = null;
+    }
+    const results = await installSkills({ registry });
     for (const r of results) {
       if (r.status === 'installed') console.log(`Installed /${r.name} -> ${r.path}`);
+      else if (r.status === 'removed-stale') console.log(`Removed stale /${r.name}`);
       else console.error(`/${r.name}: ${r.message || r.status}`);
     }
     if (results.some(r => r.status === 'skipped-foreign')) return 2;
-    console.log('\nRestart Cursor (or reload the window), then type /ai or /ai-team in Agent chat.');
+    console.log('\nRestart Cursor (or reload the window), then type /ai, /ai-team, /ai-codex, or /ai-models in Agent chat.');
     return 0;
   }
   if (parsed.command === 'uninstall-skills') {

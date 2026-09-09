@@ -11,8 +11,8 @@ import { mkdir, mkdtemp, rm, utimes } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 
 test('package version is read from package.json', () => {
-  assert.equal(packageVersion(), '0.9.0');
-  assert.equal(VERSION, '0.9.0');
+  assert.equal(packageVersion(), '1.0.0');
+  assert.equal(VERSION, '1.0.0');
   assert.equal(toolingRoot(), installationInfo().packageRoot);
 });
 

@@ -32,6 +32,13 @@ function envStr(env, name, fallback) {
 export const DEFAULTS = {
   defaultMode: 'auto',
   cursorModel: 'auto',
+  codexModel: 'auto',
+  geminiModel: 'auto',
+  team: {
+    cursorModel: 'auto',
+    codexModel: 'auto',
+    geminiModel: 'auto',
+  },
   cursorTimeoutMs: 5 * 60 * 1000,
   codexTimeoutMs: 10 * 60 * 1000,
   geminiTimeoutMs: 5 * 60 * 1000,
@@ -41,7 +48,18 @@ export const DEFAULTS = {
   keepFailedWorktrees: true,
 };
 
-export const USER_CONFIG_KEYS = ['defaultMode', 'cursorModel', 'keepSuccessWorktrees', 'keepFailedWorktrees', 'workerMaxRetries'];
+export const USER_CONFIG_KEYS = [
+  'defaultMode',
+  'cursorModel',
+  'codexModel',
+  'geminiModel',
+  'teamCursorModel',
+  'teamCodexModel',
+  'teamGeminiModel',
+  'keepSuccessWorktrees',
+  'keepFailedWorktrees',
+  'workerMaxRetries',
+];
 
 const BOOL_KEYS = new Set(['keepSuccessWorktrees', 'keepFailedWorktrees']);
 const INT_KEYS = new Set(['workerMaxRetries']);
@@ -62,10 +80,10 @@ export function validateConfigValue(key, value) {
     if (!mode) throw new Error('defaultMode must be auto, cursor, codex, gemini, agy, or team.');
     return mode === 'gemini' && String(value).trim().toLowerCase() === 'agy' ? 'agy' : mode;
   }
-  if (key === 'cursorModel') {
+  if (['cursorModel', 'codexModel', 'geminiModel', 'teamCursorModel', 'teamCodexModel', 'teamGeminiModel'].includes(key)) {
     const s = String(value).trim();
-    if (!s) throw new Error('cursorModel cannot be empty.');
-    if (!/^[A-Za-z0-9._+/-]+$/.test(s)) throw new Error('cursorModel contains unsupported characters.');
+    if (!s) throw new Error(`${key} cannot be empty.`);
+    if (!/^[A-Za-z0-9._+/=-]+$/.test(s)) throw new Error(`${key} contains unsupported characters.`);
     return s;
   }
   if (BOOL_KEYS.has(key)) return parseBoolSetting(value);
@@ -89,10 +107,16 @@ export function validateConfigValue(key, value) {
 function pickUserKeys(obj) {
   const out = {};
   if (!obj || typeof obj !== 'object') return out;
+  const expanded = { ...obj };
+  if (obj.team && typeof obj.team === 'object') {
+    if (obj.team.cursorModel != null) expanded.teamCursorModel = obj.team.cursorModel;
+    if (obj.team.codexModel != null) expanded.teamCodexModel = obj.team.codexModel;
+    if (obj.team.geminiModel != null) expanded.teamGeminiModel = obj.team.geminiModel;
+  }
   for (const key of USER_CONFIG_KEYS) {
-    if (obj[key] === undefined) continue;
+    if (expanded[key] === undefined) continue;
     try {
-      out[key] = validateConfigValue(key, obj[key]);
+      out[key] = validateConfigValue(key, expanded[key]);
     } catch {
       /* ignore invalid stored keys; env/defaults still apply */
     }
@@ -140,9 +164,17 @@ export async function writeUserConfigFile(updates, env = process.env) {
 export function mergeConfigLayers({ defaults = DEFAULTS, userConfig = {}, env = process.env } = {}) {
   const file = pickUserKeys(userConfig);
   const base = { ...defaults, ...file };
+  const teamDefaults = defaults.team || DEFAULTS.team;
   return {
     defaultMode: envStr(env, 'AI_DEFAULT_MODE', base.defaultMode),
     cursorModel: envStr(env, 'AI_CURSOR_MODEL', base.cursorModel),
+    codexModel: envStr(env, 'AI_CODEX_MODEL', base.codexModel || 'auto'),
+    geminiModel: envStr(env, 'AI_GEMINI_MODEL', base.geminiModel || 'auto'),
+    team: {
+      cursorModel: file.teamCursorModel || teamDefaults.cursorModel,
+      codexModel: file.teamCodexModel || teamDefaults.codexModel,
+      geminiModel: file.teamGeminiModel || teamDefaults.geminiModel,
+    },
     cursorTimeoutMs: envInt(env, 'AI_CURSOR_TIMEOUT_MS', base.cursorTimeoutMs),
     codexTimeoutMs: envInt(env, 'AI_CODEX_TIMEOUT_MS', base.codexTimeoutMs),
     geminiTimeoutMs: envInt(env, 'AI_GEMINI_TIMEOUT_MS', base.geminiTimeoutMs),
@@ -162,6 +194,6 @@ export async function loadResolvedConfig(env = process.env) {
   return mergeConfigLayers({ env, userConfig });
 }
 
-export const CONFIG_PRECEDENCE = ['CLI argument', 'environment variable', 'user config', 'built-in default'];
+export const CONFIG_PRECEDENCE = ['CLI argument', 'environment variable', 'user config', 'smart auto selection', 'built-in default'];
 
 export const config = loadConfig();

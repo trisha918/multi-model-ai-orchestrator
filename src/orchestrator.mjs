@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import process from 'node:process';
 import { isWin, resolveTool, VERSION } from './tooling.mjs';
-import { resolveRoute, teamRoles } from './router.mjs';
+import { resolveRoute, classifyTask } from './router.mjs';
 import {
   inspectSourceRepo,
   formatDirtyFiles,
@@ -25,6 +25,9 @@ import { loadResolvedConfig, loadConfig } from './config.mjs';
 import { resolveTaskInput, TaskInputError } from './task-input.mjs';
 import { workerPrompts } from './prompts.mjs';
 import { teamLoopShouldStartFix } from './team-loop.mjs';
+import { loadRegistry } from './model-cache.mjs';
+import { ModelSelectionError } from './model-registry.mjs';
+import { modelsJsonPayload, resolveRunModels } from './model-select.mjs';
 
 let config = loadConfig();
 
@@ -39,7 +42,11 @@ export function parseTaskArgs(argv, defaults = {}) {
     commitOnPass: false,
     branch: '',
     cursorModel: defaults.cursorModel || 'auto',
-    provided: { mode: false, cursorModel: false, task: false, taskFile: false, taskStdin: false },
+    codexModel: defaults.codexModel || 'auto',
+    geminiModel: defaults.geminiModel || 'auto',
+    model: '',
+    modelId: '',
+    provided: { mode: false, cursorModel: false, codexModel: false, geminiModel: false, model: false, modelId: false, task: false, taskFile: false, taskStdin: false },
     taskFile: '',
     taskStdin: false,
   };
@@ -66,10 +73,24 @@ export function parseTaskArgs(argv, defaults = {}) {
     else if (a === '--cursor-model') {
       out.cursorModel = argv[++i] ?? 'auto';
       out.provided.cursorModel = true;
+    } else if (a === '--codex-model') {
+      out.codexModel = argv[++i] ?? 'auto';
+      out.provided.codexModel = true;
+    } else if (a === '--gemini-model') {
+      out.geminiModel = argv[++i] ?? 'auto';
+      out.provided.geminiModel = true;
+    } else if (a === '--model') {
+      out.model = argv[++i] ?? '';
+      out.provided.model = true;
+    } else if (a === '--model-id') {
+      out.modelId = argv[++i] ?? '';
+      out.provided.modelId = true;
     }
   }
   if (!out.provided.mode && defaults.defaultMode) out.mode = defaults.defaultMode;
   if (!out.provided.cursorModel && defaults.cursorModel) out.cursorModel = defaults.cursorModel;
+  if (!out.provided.codexModel && defaults.codexModel) out.codexModel = defaults.codexModel;
+  if (!out.provided.geminiModel && defaults.geminiModel) out.geminiModel = defaults.geminiModel;
   return out;
 }
 
@@ -88,11 +109,11 @@ function printTimeoutArg(ms) {
   return `${minutes}m`;
 }
 
-function banner({ task, route, reason, confidence, workspace, branch }) {
+function banner({ task, route, reason, confidence, workspace, branch, modelInfo }) {
   const lines = [
-    '==============================',
+    '========================================',
     'AI ORCHESTRATOR',
-    '==============================',
+    '========================================',
     '',
     'Task:',
     task,
@@ -100,23 +121,35 @@ function banner({ task, route, reason, confidence, workspace, branch }) {
     'Route:',
     route,
     '',
-    'Confidence:',
+    'Route Confidence:',
     confidencePct(confidence),
     '',
     'Reason:',
     reason,
-    '',
-    'Workspace:',
-    workspace,
-    '',
-    'Branch:',
-    branch,
   ];
-  if (route === 'TEAM') {
-    const roles = teamRoles();
-    lines.push('', `Plan: ${roles.plan}`, `Implementation: ${roles.implementation}`, `Review: ${roles.review}`);
+  if (route === 'TEAM' && modelInfo?.stages) {
+    const s = modelInfo.stages;
+    lines.push('', 'TEAM MODEL POLICY', '');
+    lines.push('Planning:', 'Cursor', `Profile: ${s.plan.profile}`, `Model: ${s.plan.model || '(unresolved)'}`, '');
+    lines.push('Implementation:', 'Codex', `Profile: ${s.implementation.profile}`, `Model: ${s.implementation.model || '(unresolved)'}`, '');
+    lines.push('Review:', 'Gemini', `Profile: ${s.review.profile}`, `Model: ${s.review.model || '(unresolved)'}`, '');
+    lines.push('Fix:', 'Codex', `Profile: ${s.fix.profile}`, `Model: ${s.fix.model || '(unresolved)'}`);
+  } else if (modelInfo?.worker) {
+    const w = modelInfo.worker;
+    lines.push('', 'Model Selection:', w.manual ? 'MANUAL' : 'AUTO');
+    if (w.manual) {
+      lines.push('', 'Requested Alias:', w.requestedAlias || w.model);
+    } else {
+      lines.push('', 'Model Profile:', w.profile || 'auto');
+      if (w.fallback && w.preferred) {
+        lines.push('', 'Preferred:', w.preferred, 'Resolved:', w.profile, 'Reason:', w.reason);
+      }
+    }
+    lines.push('', 'Resolved Model:', w.model || '(provider default)');
+    lines.push('', 'Model Reason:', w.reason || '');
   }
-  lines.push('', '==============================', '');
+  lines.push('', 'Workspace:', workspace, '', 'Branch:', branch);
+  lines.push('', '========================================', '');
   return lines.join('\n');
 }
 
@@ -197,17 +230,19 @@ function throwIfBad(r, label) {
   }
 }
 
-async function antigravity(repo, prompt) {
+async function antigravity(repo, prompt, model = '') {
   console.log('\n--- GEMINI / ANTIGRAVITY ---\n');
+  if (model) console.log(`Model: ${model}\n`);
   const cmd = resolveTool('agy');
-  const args = [
-    '-p', prompt,
+  const args = ['-p', prompt];
+  if (model) args.push('--model', model);
+  args.push(
     '--output-format', 'json',
     '--print-timeout', printTimeoutArg(config.geminiTimeoutMs),
     '--mode', 'plan',
     '--sandbox',
     '--dangerously-skip-permissions',
-  ];
+  );
   const r = await executeProcess(cmd, args, {
     cwd: repo,
     timeoutMs: config.geminiTimeoutMs,
@@ -245,10 +280,12 @@ async function cursorAgent(repo, prompt, model = 'auto', readOnly = false, runCo
   return { text: r.stdout, proc: r };
 }
 
-async function codex(repo, prompt, windowsUnelevated) {
+async function codex(repo, prompt, windowsUnelevated, model = '') {
   console.log('\n--- CODEX ---\n');
+  if (model) console.log(`Model: ${model}\n`);
   const args = [];
   if (isWin && windowsUnelevated) args.push('-c', 'windows.sandbox="unelevated"');
+  if (model) args.push('-m', model);
   args.push('--ask-for-approval', 'never', 'exec', '--sandbox', 'workspace-write', '-');
   const r = await executeProcess(resolveTool('codex'), args, {
     cwd: repo,
@@ -276,10 +313,10 @@ function reviewDecision(review) {
   return 'UNKNOWN';
 }
 
-async function geminiReadOnly(repo, prompt, runDir) {
+async function geminiReadOnly(repo, prompt, runDir, model = '') {
   const before = await gitState(repo);
   const prefixed = `READ ONLY. DO NOT MODIFY FILES. DO NOT RUN DESTRUCTIVE COMMANDS.\n${prompt}`;
-  const out = await antigravity(repo, prefixed);
+  const out = await antigravity(repo, prefixed, model);
   const after = await gitState(repo);
   if (workingTreeChanged(before, after)) {
     await writeFile(path.join(runDir, 'gemini-safety.diff'), after.diff, 'utf8');
@@ -311,13 +348,14 @@ async function independentTests(repo, runDir) {
 export async function runTask(argv = process.argv.slice(2), options = {}) {
   config = options.config || await loadResolvedConfig(options.env || process.env);
   const args = parseTaskArgs(argv, config);
+  args.env = options.env || process.env;
   try {
     args.task = await resolveTaskInput(args, { stdin: options.stdin || process.stdin });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(msg);
     if (e instanceof TaskInputError && /Missing task/.test(msg)) {
-      console.error('Usage: ai-orchestrator run --repo "<git-root>" (--task "Your task" | --task-file <path> | --task-stdin) [--mode auto|cursor|codex|gemini|agy|team] [--max-fix-rounds 2] [--commit-on-pass] [--branch ai/my-task] [--in-place] [--windows-unelevated]');
+      console.error('Usage: ai-orchestrator run --repo "<git-root>" (--task "Your task" | --task-file <path> | --task-stdin) [--mode auto|cursor|codex|gemini|agy|team] [--model auto] [--model-id <id>] [--cursor-model auto] [--codex-model auto] [--gemini-model auto] [--max-fix-rounds 2] [--commit-on-pass] [--branch ai/my-task] [--in-place] [--windows-unelevated]');
       console.error('Also: npm run task -- --repo "<git-root>" --task "Your task" ...');
     }
     process.exitCode = e instanceof TaskInputError ? e.exitCode : 2;
@@ -369,6 +407,27 @@ export async function runTask(argv = process.argv.slice(2), options = {}) {
   const dirs = runtimeDirs(options.env || process.env);
   const runDir = path.join(dirs.runs, runId);
   await mkdir(runDir, { recursive: true });
+
+  let modelResolved;
+  try {
+    const loaded = await loadRegistry({ env: options.env || process.env, refresh: false });
+    const analysis = classifyTask(args.task);
+    modelResolved = resolveRunModels({
+      task: args.task,
+      route: route.route,
+      args,
+      config,
+      registry: loaded.registry,
+      classification: analysis,
+    });
+    await writeFile(path.join(runDir, 'models.json'), JSON.stringify(modelsJsonPayload({ route: route.route, resolved: modelResolved }), null, 2), 'utf8');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await writeFile(path.join(runDir, 'error.txt'), msg, 'utf8');
+    console.error(msg);
+    process.exitCode = e instanceof ModelSelectionError ? 2 : 1;
+    return process.exitCode;
+  }
 
 const routeRecord = {
   route: route.route,
@@ -450,6 +509,7 @@ try {
     confidence: route.confidence,
     workspace: repo,
     branch: taskBranch,
+    modelInfo: modelResolved,
   }));
 
   let planText = '';
@@ -465,56 +525,61 @@ try {
     return text;
   };
 
+  const cursorModelId = route.route === 'TEAM' ? (modelResolved.stages.plan.model || 'auto') : (modelResolved.worker?.model || args.cursorModel || 'auto');
+  const codexModelId = route.route === 'TEAM' ? (modelResolved.stages.implementation.model || '') : (modelResolved.worker?.model || '');
+  const geminiModelId = route.route === 'TEAM' ? (modelResolved.stages.review.model || '') : (modelResolved.worker?.model || '');
+  const codexFixModelId = route.route === 'TEAM' ? (modelResolved.stages.fix.model || codexModelId) : codexModelId;
+
   if (route.route === 'CURSOR') {
     result.implementation = 'FAIL';
-    const out = await cursorAgent(repo, sendToWorker('cursor-implementation', codingPrompt), args.cursorModel, false, cursorRunContext);
+    const out = await cursorAgent(repo, sendToWorker('cursor-implementation', codingPrompt), cursorModelId, false, cursorRunContext);
     await writeFile(path.join(runDir, 'implementation.txt'), out.text, 'utf8');
     result.implementation = 'PASS';
     result.implMs = out.proc.durationMs;
     timings.cursorMs += out.proc.durationMs;
     addStage('cursor-implementation', 'PASS', out.proc.durationMs);
-    usageLog.push(workerUsage({ worker: 'cursor', model: args.cursorModel, durationMs: out.proc.durationMs, attempts: out.proc.attempts }));
+    usageLog.push(workerUsage({ worker: 'cursor', model: cursorModelId, durationMs: out.proc.durationMs, attempts: out.proc.attempts }));
     tests = await independentTests(repo, runDir);
   } else if (route.route === 'GEMINI') {
     result.review = 'FAIL';
-    const out = await geminiReadOnly(repo, sendToWorker('gemini-analysis', prompts.geminiAnalysis), runDir);
+    const out = await geminiReadOnly(repo, sendToWorker('gemini-analysis', prompts.geminiAnalysis), runDir, geminiModelId);
     await writeFile(path.join(runDir, 'review.txt'), out.text, 'utf8');
     result.review = 'PASS';
     result.reviewMs = out.proc.durationMs;
     timings.geminiMs += out.proc.durationMs;
     addStage('gemini-analysis', 'PASS', out.proc.durationMs);
-    usageLog.push(workerUsage({ worker: 'gemini', model: 'antigravity', durationMs: out.proc.durationMs, attempts: out.proc.attempts, extra: { usage: out.usage } }));
+    usageLog.push(workerUsage({ worker: 'gemini', model: geminiModelId || 'antigravity', durationMs: out.proc.durationMs, attempts: out.proc.attempts, extra: { usage: out.usage } }));
     console.log('\n\nFINAL (Gemini/Antigravity):\n', out.text);
   } else if (route.route === 'CODEX') {
     result.implementation = 'FAIL';
-    const out = await codex(repo, sendToWorker('codex-implementation', codingPrompt), args.windowsUnelevated);
+    const out = await codex(repo, sendToWorker('codex-implementation', codingPrompt), args.windowsUnelevated, codexModelId);
     await writeFile(path.join(runDir, 'implementation.txt'), out.text, 'utf8');
     result.implementation = 'PASS';
     result.implMs = out.proc.durationMs;
     timings.codexMs += out.proc.durationMs;
     addStage('codex-implementation', 'PASS', out.proc.durationMs);
-    usageLog.push(workerUsage({ worker: 'codex', model: 'codex', durationMs: out.proc.durationMs, attempts: out.proc.attempts }));
+    usageLog.push(workerUsage({ worker: 'codex', model: codexModelId || 'codex', durationMs: out.proc.durationMs, attempts: out.proc.attempts }));
     tests = await independentTests(repo, runDir);
   } else {
     result.plan = 'FAIL';
-    const plan = await cursorAgent(repo, sendToWorker('cursor-plan', prompts.plan), args.cursorModel, true, cursorRunContext);
+    const plan = await cursorAgent(repo, sendToWorker('cursor-plan', prompts.plan), cursorModelId, true, cursorRunContext);
     planText = plan.text;
     await writeFile(path.join(runDir, 'plan.txt'), planText, 'utf8');
     result.plan = 'PASS';
     result.planMs = plan.proc.durationMs;
     timings.cursorMs += plan.proc.durationMs;
     addStage('cursor-plan', 'PASS', plan.proc.durationMs);
-    usageLog.push(workerUsage({ worker: 'cursor', model: args.cursorModel, durationMs: plan.proc.durationMs, attempts: plan.proc.attempts }));
+    usageLog.push(workerUsage({ worker: 'cursor', model: cursorModelId, durationMs: plan.proc.durationMs, attempts: plan.proc.attempts }));
 
     result.implementation = 'FAIL';
-    const implementation = await codex(repo, sendToWorker('codex-implementation', prompts.implementation(planText)), args.windowsUnelevated);
+    const implementation = await codex(repo, sendToWorker('codex-implementation', prompts.implementation(planText)), args.windowsUnelevated, codexModelId);
     implementationText = implementation.text;
     await writeFile(path.join(runDir, 'implementation.txt'), implementationText, 'utf8');
     result.implementation = 'PASS';
     result.implMs = implementation.proc.durationMs;
     timings.codexMs += implementation.proc.durationMs;
     addStage('codex-implementation', 'PASS', implementation.proc.durationMs);
-    usageLog.push(workerUsage({ worker: 'codex', model: 'codex', durationMs: implementation.proc.durationMs, attempts: implementation.proc.attempts }));
+    usageLog.push(workerUsage({ worker: 'codex', model: codexModelId || 'codex', durationMs: implementation.proc.durationMs, attempts: implementation.proc.attempts }));
 
     tests = await independentTests(repo, runDir);
     timings.testsMs += tests.durationMs || 0;
@@ -525,14 +590,14 @@ try {
     for (;;) {
       if (tests.status === 'PASS' || tests.status === 'SKIP') {
         result.review = 'FAIL';
-        const review = await geminiReadOnly(repo, sendToWorker(round === 0 ? 'gemini-review' : `gemini-review-${round}`, prompts.review), runDir);
+        const review = await geminiReadOnly(repo, sendToWorker(round === 0 ? 'gemini-review' : `gemini-review-${round}`, prompts.review), runDir, geminiModelId);
         reviewText = review.text;
         await writeFile(path.join(runDir, 'review.txt'), reviewText, 'utf8');
         decision = reviewDecision(reviewText);
         result.reviewMs = (result.reviewMs || 0) + review.proc.durationMs;
         timings.geminiMs += review.proc.durationMs;
         addStage(round === 0 ? 'gemini-review' : `gemini-review-${round}`, decision === 'PASS' ? 'PASS' : decision, review.proc.durationMs);
-        usageLog.push(workerUsage({ worker: 'gemini', model: 'antigravity', durationMs: review.proc.durationMs, attempts: review.proc.attempts, extra: { usage: review.usage } }));
+        usageLog.push(workerUsage({ worker: 'gemini', model: geminiModelId || 'antigravity', durationMs: review.proc.durationMs, attempts: review.proc.attempts, extra: { usage: review.usage } }));
         console.log(`\n\nREVIEW DECISION: ${decision}\n`);
         if (decision === 'PASS') break;
       } else {
@@ -557,13 +622,13 @@ try {
         reviewText && decision === 'NEEDS_FIXES' ? `\nA strict reviewer found these issues:\n---\n${reviewText}\n---` : '',
         '\nFix ONLY the material issues. Do not commit or push.',
       ].join('\n');
-      const fix = await codex(repo, sendToWorker(`codex-fix-${round}`, fixPrompt), args.windowsUnelevated);
+      const fix = await codex(repo, sendToWorker(`codex-fix-${round}`, fixPrompt), args.windowsUnelevated, codexFixModelId);
       implementationText = fix.text;
       await writeFile(path.join(runDir, `fix-round-${round}.txt`), fix.text, 'utf8');
       result.implementation = 'PASS';
       timings.codexMs += fix.proc.durationMs;
       addStage(`codex-fix-${round}`, 'PASS', fix.proc.durationMs);
-      usageLog.push(workerUsage({ worker: 'codex', model: 'codex', durationMs: fix.proc.durationMs, attempts: fix.proc.attempts }));
+      usageLog.push(workerUsage({ worker: 'codex', model: codexFixModelId || 'codex', durationMs: fix.proc.durationMs, attempts: fix.proc.attempts }));
 
       tests = await independentTests(repo, runDir);
       timings.testsMs += tests.durationMs || 0;

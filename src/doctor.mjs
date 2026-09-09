@@ -5,7 +5,8 @@ import { existsSync } from 'node:fs';
 import { resolveTool, runTool, packageRoot, VERSION } from './tooling.mjs';
 import { loadResolvedConfig } from './config.mjs';
 import { installationInfo, requiredNodeEngine } from './paths.mjs';
-import { skillStatus } from './skills.mjs';
+import { skillStatus, CORE_SKILLS } from './skills.mjs';
+import { loadRegistry } from './model-cache.mjs';
 import { nodeSatisfiesEngine } from './install-helpers.mjs';
 
 export const HINTS = {
@@ -48,7 +49,13 @@ export async function checkAuth(name, args, passRe, hint) {
 export async function collectDoctorReport(env = process.env) {
   const config = await loadResolvedConfig(env);
   const info = installationInfo(env);
-  const skills = skillStatus(env);
+  let models = { registry: null, fromCache: false, error: '' };
+  try {
+    models = await loadRegistry({ env, refresh: false });
+  } catch (e) {
+    models = { registry: null, fromCache: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  const skills = skillStatus(env, models.registry);
 
   const node = await checkVersion('node');
   const npm = await checkVersion('npm');
@@ -73,9 +80,10 @@ export async function collectDoctorReport(env = process.env) {
   if (!codex.ok) auths.codex = { ok: false, text: 'Codex CLI was not found, so authentication cannot be checked.' };
   if (!agy.ok) auths.agy = { ok: false, text: 'Antigravity CLI was not found, so authentication cannot be checked.' };
 
+  const coreMissing = skills.filter(s => CORE_SKILLS.some(c => c.name === s.name) && !s.ok);
   const failed = !node.ok || !npm.ok || !git.ok || !codex.ok || !agy.ok || !agent.ok
     || !auths.cursor.ok || !auths.codex.ok || !auths.agy.ok
-    || skills.some(s => !s.ok);
+    || coreMissing.length > 0;
 
   return {
     version: VERSION,
@@ -85,6 +93,7 @@ export async function collectDoctorReport(env = process.env) {
     checks: { node, npm, git, agent, codex, agy },
     auths,
     skills,
+    models,
     failed,
     ready: !failed,
   };
@@ -130,8 +139,25 @@ export function formatDoctor(report) {
   lines.push('Cursor Skills:');
   for (const s of report.skills) {
     const mark = s.ok ? 'OK' : s.status === 'missing' ? 'MISSING' : (s.status === 'legacy' ? 'LEGACY (upgrade with install-skills)' : s.status.toUpperCase());
-    lines.push(`/${s.name.padEnd(8)} ${mark}`);
+    lines.push(`/${s.name.padEnd(22)} ${mark}`);
   }
+  lines.push('');
+  lines.push('Model discovery:');
+  const providers = report.models?.registry?.providers || {};
+  const cursorModels = providers.cursor;
+  const codexModels = providers.codex;
+  const geminiModels = providers.gemini;
+  const statusLine = (bucket, okWorker) => {
+    if (!bucket) return okWorker ? 'unavailable (worker may still function)' : 'unavailable';
+    if (bucket.status === 'ok') return `OK (${(bucket.models || []).length} models, ${bucket.source})`;
+    if (bucket.status === 'partial') return `partial (${bucket.source || 'limited local evidence'})`;
+    return `unavailable${okWorker ? ' (worker may still function)' : ''}`;
+  };
+  lines.push(`Cursor models: ${statusLine(cursorModels, report.checks.agent.ok)}`);
+  lines.push(`Codex models: ${statusLine(codexModels, report.checks.codex.ok)}`);
+  lines.push(`Gemini models: ${statusLine(geminiModels, report.checks.agy.ok)}`);
+  if (report.models?.error) lines.push(`Discovery error: ${report.models.error}`);
+  lines.push(`Model cache: ${report.info.modelsCachePath}${report.models?.fromCache ? ' (hit)' : ''}`);
   lines.push('');
   lines.push('Config:');
   lines.push(report.info.configPath);
@@ -178,6 +204,7 @@ export function formatInstallSummary(report) {
     `Gemini            ${status(report.checks.agy.ok)}`,
     `/ai Skill         ${skill('ai')}`,
     `/ai-team Skill    ${skill('ai-team')}`,
+    `/ai-models Skill  ${skill('ai-models')}`,
     '',
     'Installation:',
     report.packageRoot,

@@ -12,7 +12,10 @@ import {
   installSkills,
   uninstallSkills,
   skillStatus,
+  skillsToInstall,
 } from './skills.mjs';
+import { finalizeRegistry, emptyRegistry } from './model-registry.mjs';
+import { parseCodexModelsCache, parseAgyModelsOutput } from './model-discovery.mjs';
 import { packageRoot } from './paths.mjs';
 
 test('generated skill contains no clone-specific absolute path and calls global CLI', () => {
@@ -94,6 +97,45 @@ test('uninstall skills removes owned skills only', async () => {
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test('generated alias skills only when registry can resolve them', () => {
+  const empty = skillsToInstall(null);
+  assert.ok(empty.some(s => s.name === 'ai-codex'));
+  assert.ok(empty.some(s => s.name === 'ai-models'));
+  assert.ok(!empty.some(s => s.name === 'ai-codex-sol'));
+  const r = emptyRegistry();
+  r.providers.codex = {
+    status: 'ok', source: 'x', lastChecked: 't',
+    models: parseCodexModelsCache({ models: [{ slug: 'gpt-5.6-sol', visibility: 'list' }] }),
+  };
+  r.providers.gemini = {
+    status: 'ok', source: 'x', lastChecked: 't',
+    models: parseAgyModelsOutput('gemini-3.8-flash-high\tH\n'),
+  };
+  const list = skillsToInstall(finalizeRegistry(r));
+  assert.ok(list.some(s => s.name === 'ai-codex-sol'));
+  assert.ok(!list.some(s => s.name === 'ai-codex-luna'));
+  assert.ok(list.some(s => s.name === 'ai-gemini-flash-high'));
+});
+
+test('/ai-codex /ai-gemini /ai-models and profile skills are portable', () => {
+  const codex = skillMarkdown({ name: 'ai-codex', mode: 'codex', description: 'd' });
+  const gemini = skillMarkdown({ name: 'ai-gemini', mode: 'gemini', description: 'd' });
+  const sol = skillMarkdown({ name: 'ai-codex-sol', mode: 'codex', model: 'sol', description: 'd' });
+  const models = skillMarkdown({ name: 'ai-models', kind: 'models', description: 'd' });
+  for (const text of [codex, gemini, sol]) {
+    assert.match(text, /\bai-orchestrator\b/);
+    assert.match(text, /--task-file/);
+    assert.equal(skillContainsClonePath(text), false);
+    assert.ok(!text.includes(packageRoot()));
+  }
+  assert.match(codex, /'--mode','codex'/);
+  assert.match(gemini, /'--mode','gemini'/);
+  assert.match(sol, /'--model','sol'/);
+  assert.match(models, /ai-orchestrator @\('models'\)/);
+  assert.doesNotMatch(models, /--task-file/);
+  assert.ok(!models.includes(packageRoot()));
 });
 
 test('v0.8 clone-path skills are recognized as ours for upgrade', () => {

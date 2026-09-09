@@ -2,7 +2,7 @@
 
 A local multi-model coding orchestrator for Cursor that routes development tasks between Cursor Agent, OpenAI Codex, Google Gemini/Antigravity, or a coordinated multi-agent team.
 
-Current version: **v0.9.0**
+Current version: **v1.0.0**
 
 **Validated platform: Windows.** macOS and Linux are not claimed and have not been tested as supported hosts.
 
@@ -62,7 +62,7 @@ Router
 
 The opened Cursor workspace is the source repository. Runtime artifacts live under `%LOCALAPPDATA%\MultiModelAIOrchestrator\`. The orchestrator clone is not the project you normally edit.
 
-v0.9 can send work to:
+v1.0 can send work to:
 
 - **CURSOR** — Cursor Agent CLI (default model `auto`)
 - **CODEX** — OpenAI Codex CLI (`codex exec`)
@@ -99,6 +99,8 @@ After installation, these commands work from any PowerShell directory:
 ai-orchestrator doctor
 ai-orchestrator version
 ai-orchestrator run --repo "C:\Projects\My App" --mode auto --commit-on-pass --task "Fix the login bug and add tests"
+ai-orchestrator models
+ai-orchestrator models refresh
 ai-orchestrator cleanup
 ai-orchestrator config show
 ai-orchestrator config path
@@ -167,6 +169,10 @@ They call `ai-orchestrator`, never `C:\some\clone\scripts\run-task.ps1`.
 
 `/ai-team <task>` is the same with `--mode team`.
 
+`/ai-cursor`, `/ai-codex`, and `/ai-gemini` force that worker with **automatic model** selection.
+
+`/ai-models` is read-only and does not need a Git project: `ai-orchestrator models`.
+
 Task text is **not** passed as `--task` from Cursor skills, so Windows PowerShell cannot strip embedded quotes. Manual CLI use may still pass `--task` (or `--task-stdin`). Skills delete only the inbox file they created.
 
 Task input is exclusive: `--task`, `--task-file`, and `--task-stdin` cannot be combined.
@@ -202,6 +208,13 @@ Example:
 {
   "defaultMode": "auto",
   "cursorModel": "auto",
+  "codexModel": "auto",
+  "geminiModel": "auto",
+  "team": {
+    "cursorModel": "auto",
+    "codexModel": "auto",
+    "geminiModel": "auto"
+  },
   "keepSuccessWorktrees": false,
   "keepFailedWorktrees": true,
   "workerMaxRetries": 1
@@ -217,12 +230,13 @@ ai-orchestrator config set cursorModel auto
 
 **Precedence (highest first):**
 
-1. CLI argument
-2. Environment variable
+1. CLI argument (`--model`, `--model-id`, `--cursor-model`, `--codex-model`, `--gemini-model`)
+2. Environment variable (`AI_DEFAULT_MODE`, `AI_CURSOR_MODEL`, `AI_CODEX_MODEL`, `AI_GEMINI_MODEL`)
 3. User config
-4. Built-in default
+4. Smart auto selection
+5. Built-in default
 
-Timeouts remain environment-driven: `AI_CURSOR_TIMEOUT_MS`, `AI_CODEX_TIMEOUT_MS`, `AI_GEMINI_TIMEOUT_MS`, `AI_TEST_TIMEOUT_MS`. Mode/model/retry/worktree-keep settings also honor `AI_DEFAULT_MODE`, `AI_CURSOR_MODEL`, `AI_WORKER_MAX_RETRIES`, `AI_KEEP_SUCCESS_WORKTREES`, `AI_KEEP_FAILED_WORKTREES`.
+Timeouts remain environment-driven: `AI_CURSOR_TIMEOUT_MS`, `AI_CODEX_TIMEOUT_MS`, `AI_GEMINI_TIMEOUT_MS`, `AI_TEST_TIMEOUT_MS`. Mode/model/retry/worktree-keep settings also honor `AI_DEFAULT_MODE`, `AI_CURSOR_MODEL`, `AI_CODEX_MODEL`, `AI_GEMINI_MODEL`, `AI_WORKER_MAX_RETRIES`, `AI_KEEP_SUCCESS_WORKTREES`, `AI_KEEP_FAILED_WORKTREES`.
 
 ## Runtime data locations
 
@@ -234,13 +248,15 @@ Timeouts remain environment-driven: `AI_CURSOR_TIMEOUT_MS`, `AI_CODEX_TIMEOUT_MS
 | Skills | `%USERPROFILE%\.cursor\skills\ai` and `ai-team` |
 | Install / package | the Git clone you ran `.\install.ps1` from |
 
-v0.8 stored `runs/` and `worktrees/` inside the clone. v0.9 uses the per-user LocalAppData directories so moving or updating the clone does not scatter runtime data. Cleanup still understands leftover clone-local artifact folders if they exist. It never touches unrelated directories.
+v0.8 stored `runs/` and `worktrees/` inside the clone. v0.9+ uses the per-user LocalAppData directories so moving or updating the clone does not scatter runtime data. Cleanup still understands leftover clone-local artifact folders if they exist. It never touches unrelated directories.
+
+Model discovery cache: `%APPDATA%\MultiModelAIOrchestrator\models-cache.json` (no credentials).
 
 Overrides for tests or unusual setups: `AI_ORCHESTRATOR_CONFIG_DIR`, `AI_ORCHESTRATOR_RUNTIME_ROOT`, `AI_ORCHESTRATOR_SKILLS_DIR`.
 
 ## Updating
 
-There is **no** `ai-orchestrator update` in v0.9 (a self-updater is too easy to get wrong). From the clone:
+There is **no** `ai-orchestrator update` in v1.0 (a self-updater is too easy to get wrong). From the clone:
 
 ```powershell
 git pull
@@ -288,6 +304,50 @@ Cursor Agent discovery (PATH not required):
 `--mode agy` is a backwards-compatible alias of `gemini`. Labels still say **GEMINI**.
 
 Explicit `--mode cursor|codex|gemini|agy|team` overrides the auto router and reports confidence **100%**.
+
+## MODEL SELECTION
+
+v1.0 adds **smart model routing** and **manual model overrides** on top of worker routing. Short aliases do **not** include version numbers, so they map to the currently available generation. The exact resolved model id is always printed and written to `models.json` in the run log.
+
+| Skill / CLI | Worker | Model |
+| --- | --- | --- |
+| `/ai` | AUTO WORKER | AUTO MODEL |
+| `/ai-team` | TEAM | AUTO MODEL PER STAGE |
+| `/ai-cursor` | FORCE CURSOR | AUTO CURSOR MODEL |
+| `/ai-codex` | FORCE CODEX | AUTO CODEX MODEL |
+| `/ai-gemini` | FORCE GEMINI | AUTO GEMINI MODEL |
+| `/ai-codex-sol` | FORCE CODEX | MANUAL alias `sol` → current verified Sol-family id |
+| `/ai-gemini-pro-high` | FORCE GEMINI | MANUAL alias `pro-high` → current verified Pro High id |
+| `/ai-models` | (none) | Lists discovered models |
+
+**AUTO vs MANUAL**
+
+- AUTO (smart router) may fall back to the next available capability tier (`max` → `strong` → …) and logs Preferred / Resolved / Reason.
+- MANUAL (explicit `--model`, `--model-id`, skill alias, or non-`auto` config/env) **never** silently switches to another model. If `sol` is unavailable the run fails with `REQUESTED MODEL UNAVAILABLE`.
+
+Stable profiles: `auto`, `fast`, `balanced`, `strong`, `max`. Profiles are not model ids.
+
+```powershell
+ai-orchestrator run --mode codex --model auto --task-file $taskFile
+ai-orchestrator run --mode codex --model sol --task-file $taskFile
+ai-orchestrator run --mode gemini --model pro-high --task-file $taskFile
+ai-orchestrator run --mode gemini --model strong --task-file $taskFile
+ai-orchestrator run --mode gemini --model-id gemini-3.8-flash-low --task-file $taskFile
+ai-orchestrator run --mode team --cursor-model auto --codex-model sol --gemini-model pro-high --task-file $taskFile
+```
+
+`--model` and `--model-id` together is an error. Manual Gemini ids are validated against the current `agy models` registry before invocation so Antigravity cannot silently fall back.
+
+Discovery sources:
+
+- Gemini: `agy models` (live)
+- Cursor: Cursor Agent `--list-models`
+- Codex: no `codex models` subcommand; uses local `~/.codex/models_cache.json` and `config.toml` when present. Availability is **YES** only when confirmed.
+
+```powershell
+ai-orchestrator models
+ai-orchestrator models refresh
+```
 
 ## Git worktree isolation and main workspace protection
 

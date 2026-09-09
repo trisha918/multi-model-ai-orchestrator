@@ -2,7 +2,7 @@
 
 ارکستراتور محلی چندمدلی برای Cursor. کار توسعه را بین Cursor Agent، OpenAI Codex، Google Gemini از طریق Antigravity، یا گردش‌کار هماهنگ TEAM مسیر‌دهی می‌کند.
 
-نسخه فعلی: **v0.9.0**  
+نسخه فعلی: **v1.0.0**  
 پلتفرم تأییدشده: **Windows**. macOS و Linux به‌عنوان میزبان پشتیبانی‌شده ادعا نمی‌شوند.
 
 ## شروع سریع
@@ -49,6 +49,7 @@ ai-orchestrator doctor
 ai-orchestrator doctor
 ai-orchestrator version
 ai-orchestrator run --repo "C:\Projects\My App" --mode auto --commit-on-pass --task "Fix the login bug"
+ai-orchestrator models
 ai-orchestrator cleanup
 ai-orchestrator config show
 ai-orchestrator install-skills
@@ -73,7 +74,23 @@ Cursor، Codex، Antigravity، Git و Node را **خودکار نصب نمی‌�
 
 مسیر: `%APPDATA%\MultiModelAIOrchestrator\config.json`
 
-اولویت: آرگومان CLI → متغیر محیطی → فایل کاربر → پیش‌فرض داخلی.
+اولویت: آرگومان CLI → متغیر محیطی → فایل کاربر → انتخاب خودکار هوشمند → پیش‌فرض داخلی.
+
+`AI_CURSOR_MODEL`، `AI_CODEX_MODEL`، `AI_GEMINI_MODEL`
+
+## انتخاب مدل
+
+| دستور | کارگر | مدل |
+| --- | --- | --- |
+| `/ai` | کارگر خودکار | مدل خودکار |
+| `/ai-team` | TEAM | مدل خودکار در هر مرحله |
+| `/ai-codex` | Codex | مدل خودکار Codex |
+| `/ai-codex-sol` | Codex | دستی: alias فعلی Sol |
+| `/ai-gemini` | Gemini | مدل خودکار Gemini |
+| `/ai-gemini-pro-high` | Gemini | دستی: Pro High فعلی |
+| `/ai-models` | — | فهرست مدل‌های کشف‌شده |
+
+AUTO می‌تواند به سطح قابلیت بعدی برگردد. MANUAL اگر مدل موجود نباشد شکست می‌خورد و مدل دیگری را بی‌صدا جایگزین نمی‌کند. aliasها شماره نسخه ندارند تا نسل فعلی را پیدا کنند؛ شناسهٔ دقیق همیشه در خروجی و `models.json` ثبت می‌شود.
 
 `ai-orchestrator config show` / `config path` / `config set defaultMode auto`
 
@@ -119,7 +136,7 @@ npm install
 
 ## وضعیت پروژه
 
-نسخه v0.9.0. این مخزن فعلاً فایل License ندارد.
+نسخه v1.0.0. این مخزن فعلاً فایل License ندارد.
 
 ## سلب مسئولیت
 

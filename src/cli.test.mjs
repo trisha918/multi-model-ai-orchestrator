@@ -37,6 +37,8 @@ test('CLI command parsing', () => {
   assert.equal(parseCli(['config', 'set', 'defaultMode', 'auto']).key, 'defaultMode');
   assert.equal(parseCli(['install-skills']).command, 'install-skills');
   assert.equal(parseCli(['uninstall-skills']).command, 'uninstall-skills');
+  assert.equal(parseCli(['models']).command, 'models');
+  assert.equal(parseCli(['models', 'refresh']).refresh, true);
   assert.equal(parseCli(['nope']).command, 'unknown');
   const run = parseCli(['run', '--repo', 'C:\\Projects\\My App', '--mode', 'auto', '--task', 'Fix it']);
   assert.equal(run.command, 'run');
@@ -51,14 +53,15 @@ test('special-character preservation through global CLI parser', () => {
   const task = `Fix this! Use "quotes" & don't break | < > % ^`;
   const parsed = parseCli(['run', '--repo', '/tmp/repo', '--task', task, '--mode', 'cursor']);
   assert.equal(parsed.taskArgs.task, task);
-  const args = parseTaskArgs(['--task', task, '--repo', 'x']);
+  const args = parseTaskArgs(['--task', task, '--repo', 'x', '--model', 'sol']);
   assert.equal(args.task, task);
+  assert.equal(args.model, 'sol');
 });
 
 test('global CLI version works outside repository cwd', () => {
   const r = runCli(['version'], { cwd: os.tmpdir() });
   assert.equal(r.status, 0, r.stderr || r.stdout);
-  assert.match(r.stdout, /Multi-Model AI Orchestrator v0\.9\.0/);
+  assert.match(r.stdout, /Multi-Model AI Orchestrator v1\.0\.0/);
 });
 
 test('global CLI doctor works outside repository cwd', () => {

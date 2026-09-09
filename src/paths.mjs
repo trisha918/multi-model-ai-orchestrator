@@ -43,6 +43,10 @@ export function userConfigPath(env = process.env) {
   return path.join(userConfigDir(env), 'config.json');
 }
 
+export function modelsCachePath(env = process.env) {
+  return path.join(userConfigDir(env), 'models-cache.json');
+}
+
 export function runtimeRoot(env = process.env) {
   const override = env.AI_ORCHESTRATOR_RUNTIME_ROOT;
   if (override) return path.resolve(override);
@@ -78,6 +82,7 @@ export function installationInfo(env = process.env) {
     packageRoot: packageRoot(),
     configDir: userConfigDir(env),
     configPath: userConfigPath(env),
+    modelsCachePath: modelsCachePath(env),
     runtimeRoot: dirs.root,
     runs: dirs.runs,
     worktrees: dirs.worktrees,
