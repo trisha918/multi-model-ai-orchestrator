@@ -791,7 +791,7 @@ try {
   result.commit = commitResult.hash || (commitResult.reason ? commitResult.reason : 'none');
   if (!success) result.ok = false;
   console.log(summaryBlock(result));
-  if (!result.ok) process.exit(1);
+  return result.ok ? 0 : 1;
 } catch (err) {
   const msg = err instanceof Error ? err.stack ?? err.message : String(err);
   await writeFile(path.join(runDir, 'error.txt'), msg, 'utf8');

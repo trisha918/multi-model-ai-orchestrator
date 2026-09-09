@@ -15,8 +15,9 @@ import { userConfigPath, installationInfo } from './paths.mjs';
 import { installSkills, uninstallSkills } from './skills.mjs';
 import { loadRegistry } from './model-cache.mjs';
 import { formatModelsReport } from './model-registry.mjs';
+import { parseGithubCli, githubHelpText, cmdGithub } from './github-cli.mjs';
 
-export const COMMANDS = ['doctor', 'version', 'run', 'cleanup', 'config', 'install-skills', 'uninstall-skills', 'models'];
+export const COMMANDS = ['doctor', 'version', 'run', 'cleanup', 'config', 'install-skills', 'uninstall-skills', 'models', 'github'];
 
 export function printVersion() {
   return `Multi-Model AI Orchestrator v${VERSION}`;
@@ -54,6 +55,9 @@ export function parseCli(argv) {
   if (command === 'models') {
     return { command: 'models', argv: rest, refresh: rest[0] === 'refresh' };
   }
+  if (command === 'github') {
+    return { command: 'github', argv: rest, github: parseGithubCli(rest) };
+  }
   if (command === 'config') {
     const sub = rest[0] || 'show';
     return {
@@ -84,6 +88,7 @@ export function helpText() {
     '  version             Print the package version',
     '  run                 Run a task (same flags as npm run task)',
     '  models              Show discovered models (use `models refresh` to re-query CLIs)',
+    '  github              Optional GitHub issue automation (see `github --help`)',
     '  cleanup             List or delete old runs/worktrees (dry-run unless --apply)',
     '  config show         Show effective configuration',
     '  config path         Print the user config.json path',
@@ -105,7 +110,9 @@ export function helpText() {
     `Config precedence: ${CONFIG_PRECEDENCE.join(' → ')}`,
     'Model env overrides: AI_CURSOR_MODEL, AI_CODEX_MODEL, AI_GEMINI_MODEL',
     '',
-    'There is no ai-orchestrator update in v1.0. To update a Git clone:',
+    githubHelpText(),
+    '',
+    'There is no ai-orchestrator update in v1.1. To update a Git clone:',
     '  git pull',
     '  npm install',
     '  .\\install.ps1',
@@ -203,6 +210,14 @@ export async function main(argv = process.argv.slice(2)) {
     } catch (e) {
       console.error(e instanceof Error ? e.message : String(e));
       return 1;
+    }
+  }
+  if (parsed.command === 'github') {
+    try {
+      return await cmdGithub(parsed.github || parseGithubCli(parsed.argv));
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      return 2;
     }
   }
   if (parsed.command === 'install-skills') {

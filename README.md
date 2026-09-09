@@ -2,7 +2,7 @@
 
 A local multi-model coding orchestrator for Cursor that routes development tasks between Cursor Agent, OpenAI Codex, Google Gemini/Antigravity, or a coordinated multi-agent team.
 
-Current version: **v1.0.0**
+Current version: **v1.1.0**
 
 [![CI](https://github.com/trisha918/multi-model-ai-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/trisha918/multi-model-ai-orchestrator/actions/workflows/ci.yml)
 
@@ -46,7 +46,9 @@ You should not need to know where this repository was cloned. Cursor skills call
 
 ## Release
 
-Release notes for **v1.0.0** (smart worker and model routing, TEAM workspace pinning, portable installer): [docs/releases/v1.0.0.md](docs/releases/v1.0.0.md).
+Release notes: [v1.0.0](docs/releases/v1.0.0.md) · [v1.1.0 GitHub Automation Engine](docs/releases/v1.1.0.md)
+
+Detailed guides: [Installation](docs/INSTALLATION.md) · [Models](docs/MODELS.md) · [GitHub automation](docs/AUTOMATION.md) · [Live GitHub test](docs/GITHUB-LIVE-TEST.md) · [Issue workflow](docs/ISSUE-WORKFLOW.md) · [Configuration](docs/CONFIGURATION.md) · [Security](docs/SECURITY.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
 
 ## Overview
 
@@ -95,7 +97,7 @@ flowchart TD
   router --> team
 ```
 
-The orchestrator does not merge to `main`/`master` and does not push.
+Local `/ai` runs do not merge to `main`/`master` and do not push. Optional GitHub automation (v1.1) may push an **AI branch** and open a PR; it still never merges or deploys by default.
 
 ## Global CLI
 
@@ -107,6 +109,7 @@ ai-orchestrator version
 ai-orchestrator run --repo "C:\Projects\My App" --mode auto --commit-on-pass --task "Fix the login bug and add tests"
 ai-orchestrator models
 ai-orchestrator models refresh
+ai-orchestrator github --help
 ai-orchestrator cleanup
 ai-orchestrator config show
 ai-orchestrator config path
@@ -290,7 +293,7 @@ Overrides for tests or unusual setups: `AI_ORCHESTRATOR_CONFIG_DIR`, `AI_ORCHEST
 
 ## Updating
 
-There is **no** `ai-orchestrator update` in v1.0 (a self-updater is too easy to get wrong). From the clone:
+There is **no** `ai-orchestrator update` in v1.1 (a self-updater is too easy to get wrong). From the clone:
 
 ```powershell
 git pull
@@ -405,6 +408,62 @@ npm run cleanup
 
 Only run-id-shaped folders under the managed runs/worktrees roots are considered.
 
+## GitHub Automation
+
+v1.1 can optionally turn a GitHub Issue into an implementation branch, pull request, CI watch, and bounded fix loop. **Default is off (`manual`).** There is no automatic merge or production deploy in v1.1.
+
+```text
+GitHub Issue
+    ↓  (nothing happens yet)
+Maintainer adds label ai-auto (trusted actor only)
+    ↓
+GitHub Actions (self-hosted Windows runner)
+    ↓
+ai-orchestrator github issue run
+    ↓
+Isolated worktree + AI workers
+    ↓
+Push AI branch → open PR → watch GitHub CI
+    ↓
+CI fail → AI fix (max 5) → CI pass
+    ↓
+READY FOR HUMAN MERGE
+```
+
+```mermaid
+flowchart TD
+  issue[GitHub Issue created]
+  idle[No automation]
+  label["Trusted actor adds ai-auto"]
+  gate[Authorization gate]
+  work[AI implement in worktree]
+  pr[Push AI branch and open PR]
+  ci[Watch GitHub CI]
+  fix[AI fix round]
+  ready[Ready for human merge]
+  review[Human review required]
+
+  issue --> idle
+  idle --> label --> gate
+  gate -->|untrusted| review
+  gate -->|trusted| work --> pr --> ci
+  ci -->|PASS| ready
+  ci -->|FAIL under max| fix --> ci
+  ci -->|5 failures| review
+```
+
+1. Install the orchestrator (`.\install.ps1`, then `ai-orchestrator doctor`).
+2. Register a **self-hosted Windows** runner **only on a private test repo**, with labels `[self-hosted, Windows, ai-orchestrator]`.
+3. Verify the machine: `.\scripts\verify-ai-runner.ps1`
+4. Copy `examples/github-e2e-test` (includes assisted `.github/ai-orchestrator.yml`).
+5. `ai-orchestrator github labels setup --repo OWNER/ai-orchestrator-e2e-test`
+6. Create an Issue. **Do not** add `ai-auto` yet — nothing should happen.
+7. A trusted maintainer adds `ai-auto`.
+8. Watch the hosted authorization job, then the AI runner, branch, PR, and Checks.
+9. Merge **manually** after `ai-ready-to-merge`. v1.1 never merges.
+
+First live test (private repo only): [docs/GITHUB-LIVE-TEST.md](docs/GITHUB-LIVE-TEST.md). Also [docs/AUTOMATION.md](docs/AUTOMATION.md) and [docs/SECURITY.md](docs/SECURITY.md).
+
 ## Troubleshooting
 
 ### `ai-orchestrator` is not recognized
@@ -468,7 +527,8 @@ Clone paths such as `C:\AI Tools\multi-model-ai-orchestrator` and project paths 
 - Exact token/dollar cost is not available for all subscription-based workers.
 - AI-generated branches must be reviewed before merging.
 - Windows is the validated platform; macOS/Linux are untested as hosts.
-- There is no automatic GitHub PR, merge, deploy, or `ai-orchestrator update`.
+- v1.1 GitHub automation is optional and ends at **ready for human merge**. It does not auto-merge, deploy, or publish.
+- There is no `ai-orchestrator update` command.
 
 ## Contributing
 

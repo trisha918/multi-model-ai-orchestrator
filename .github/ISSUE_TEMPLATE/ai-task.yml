@@ -1,0 +1,62 @@
+name: AI task
+description: Request an AI-assisted change. Automation does not start until a trusted maintainer adds the ai-auto label.
+title: "[AI] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fill in the sections below. **Do not paste secrets, tokens, passwords, or private keys.**
+
+        Creating this issue does **not** start AI automation. A trusted maintainer (OWNER, MEMBER, or COLLABORATOR) must add the `ai-auto` label after reviewing the request.
+  - type: input
+    id: task_title
+    attributes:
+      label: Task title
+      description: Short summary of the change
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / request
+      description: What is wrong or what should be added?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+    validations:
+      required: true
+  - type: textarea
+    id: testing
+    attributes:
+      label: Testing requirements
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Relevant files/components
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - low
+        - normal
+        - high
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Optional notes
+      description: Extra context. This text is treated as task requirements, not trusted orchestration instructions.

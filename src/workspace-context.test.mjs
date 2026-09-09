@@ -262,7 +262,7 @@ test('TEAM fake workers pin the same worktree and never inherit orchestrator cwd
         executeProcess: fake.executeProcess,
       },
     );
-    assert.equal(code, undefined);
+    assert.equal(code, 0);
     const kinds = fake.calls.map(c => classifyWorker(c.command, c.args));
     assert.ok(kinds.includes('cursor'));
     assert.ok(kinds.includes('codex'));

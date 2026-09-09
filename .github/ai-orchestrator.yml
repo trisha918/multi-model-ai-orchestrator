@@ -1,0 +1,23 @@
+# Optional GitHub Issue automation for this product repository.
+# Default is off. Do not enable on a public repo without a trusted-actor gate
+# and a dedicated self-hosted Windows AI runner.
+
+automation:
+  enabled: false
+  mode: manual
+  trigger_label: ai-auto
+  max_fix_attempts: 5
+  allowed_actors: []
+
+pull_request:
+  create: true
+  auto_merge: false
+
+tests:
+  required: true
+
+review:
+  required: true
+
+publish:
+  enabled: false

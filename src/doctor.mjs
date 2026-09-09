@@ -8,6 +8,7 @@ import { installationInfo, requiredNodeEngine } from './paths.mjs';
 import { skillStatus, CORE_SKILLS } from './skills.mjs';
 import { loadRegistry } from './model-cache.mjs';
 import { nodeSatisfiesEngine } from './install-helpers.mjs';
+import { collectGithubDoctor, formatGithubDoctor } from './github-doctor.mjs';
 
 export const HINTS = {
   node: 'Install Node.js 20+ from https://nodejs.org and reopen the terminal. Do not let the orchestrator installer install Node for you.',
@@ -94,6 +95,7 @@ export async function collectDoctorReport(env = process.env) {
     auths,
     skills,
     models,
+    github: await collectGithubDoctor({ env, cwd: process.cwd() }),
     failed,
     ready: !failed,
   };
@@ -181,6 +183,8 @@ export function formatDoctor(report) {
   lines.push(`  Gemini  ${report.config.geminiTimeoutMs} ms  (AI_GEMINI_TIMEOUT_MS)`);
   lines.push(`  Tests   ${report.config.testTimeoutMs} ms  (AI_TEST_TIMEOUT_MS)`);
   lines.push(`  Retries ${report.config.workerMaxRetries}  (AI_WORKER_MAX_RETRIES)`);
+  lines.push('');
+  lines.push(formatGithubDoctor(report.github));
   lines.push('');
   lines.push(report.ready ? 'READY' : 'NOT READY');
   return lines.join('\n');
