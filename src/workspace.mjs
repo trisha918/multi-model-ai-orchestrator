@@ -152,8 +152,8 @@ async function branchExists(repo, branch) {
   return any.code === 0;
 }
 
-export async function createIsolatedWorktree(sourceRepo, task, requestedBranch, preferredRunId = '') {
-  const dirs = runtimeDirs();
+export async function createIsolatedWorktree(sourceRepo, task, requestedBranch, preferredRunId = '', env = process.env) {
+  const dirs = runtimeDirs(env);
   await mkdir(dirs.worktrees, { recursive: true });
 
   if (requestedBranch && !BRANCH_RE.test(requestedBranch)) {
@@ -233,11 +233,11 @@ export async function listWorktrees(repo) {
   return paths;
 }
 
-export async function removeOrchestratorWorktree({ sourceRepo, worktree, runId, createdByOrchestrator }) {
+export async function removeOrchestratorWorktree({ sourceRepo, worktree, runId, createdByOrchestrator, env = process.env }) {
   if (!createdByOrchestrator || !worktree || !runId) {
     return { removed: false, reason: 'not an orchestrator worktree' };
   }
-  const dirs = runtimeDirs();
+  const dirs = runtimeDirs(env);
   if (!isInsideDir(dirs.worktrees, worktree)) {
     return { removed: false, reason: 'path is outside orchestrator worktrees/' };
   }

@@ -130,7 +130,7 @@ test('skill transport → CLI → worker prompts keep exact task', async () => {
     const prompts = workerPrompts(loaded);
     assert.equal(promptContainsExactTask(prompts.coding, EXACT_SPECIAL_TASK), true);
     assert.equal(promptContainsExactTask(prompts.plan, EXACT_SPECIAL_TASK), true);
-    assert.equal(promptContainsExactTask(prompts.review, EXACT_SPECIAL_TASK), true);
+    assert.equal(promptContainsExactTask(prompts.review({ worktree: 'C:\\isolated\\worktree' }), EXACT_SPECIAL_TASK), true);
     assert.equal(promptContainsExactTask(prompts.implementation('plan'), EXACT_SPECIAL_TASK), true);
     assert.equal(promptContainsExactTask(prompts.fixHeader, EXACT_SPECIAL_TASK), true);
     assert.equal(promptContainsExactTask(prompts.geminiAnalysis, EXACT_SPECIAL_TASK), true);

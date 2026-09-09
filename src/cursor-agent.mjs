@@ -27,9 +27,10 @@ function newestCursorNodeEntry() {
   return null;
 }
 
-export function buildCursorAgentArgs({ prompt, model = 'auto', readOnly = false, trust = false }) {
+export function buildCursorAgentArgs({ prompt, model = 'auto', readOnly = false, trust = false, workspace = '' }) {
   const args = [];
   if (trust) args.push('--trust');
+  if (workspace) args.push('--workspace', workspace);
   args.push('--model', model, '--output-format', 'text');
   if (readOnly) args.push('--mode=ask');
   args.push('-p', prompt);
@@ -62,8 +63,12 @@ export function cursorAgentLaunchSpec() {
 
 export async function runCursorAgentCli(args, opts) {
   const spec = cursorAgentLaunchSpec();
-  return executeProcess(spec.command, [...spec.prefix, ...args], {
-    cwd: opts?.cwd,
+  const exec = opts?.executeProcess || executeProcess;
+  if (!opts?.cwd) {
+    throw new Error('SAFETY FAILURE: Cursor Agent invocation is missing an explicit cwd.');
+  }
+  return exec(spec.command, [...spec.prefix, ...args], {
+    cwd: opts.cwd,
     timeoutMs: opts?.timeoutMs,
     quiet: opts?.quiet,
     env: opts?.env,

@@ -28,6 +28,14 @@ import { teamLoopShouldStartFix } from './team-loop.mjs';
 import { loadRegistry } from './model-cache.mjs';
 import { ModelSelectionError } from './model-registry.mjs';
 import { modelsJsonPayload, resolveRunModels } from './model-select.mjs';
+import {
+  WorkspaceSafetyError,
+  buildAntigravityArgs,
+  buildCodexCliArgs,
+  requireExplicitCwd,
+  verifyRunWorkspace,
+  workspaceTraceRecord,
+} from './workspace-context.mjs';
 
 let config = loadConfig();
 
@@ -230,21 +238,19 @@ function throwIfBad(r, label) {
   }
 }
 
-async function antigravity(repo, prompt, model = '') {
+async function antigravity(repo, prompt, model = '', exec = executeProcess) {
   console.log('\n--- GEMINI / ANTIGRAVITY ---\n');
   if (model) console.log(`Model: ${model}\n`);
   const cmd = resolveTool('agy');
-  const args = ['-p', prompt];
-  if (model) args.push('--model', model);
-  args.push(
-    '--output-format', 'json',
-    '--print-timeout', printTimeoutArg(config.geminiTimeoutMs),
-    '--mode', 'plan',
-    '--sandbox',
-    '--dangerously-skip-permissions',
-  );
-  const r = await executeProcess(cmd, args, {
-    cwd: repo,
+  const launch = buildAntigravityArgs({
+    prompt,
+    model,
+    cwd: requireExplicitCwd(repo, 'gemini'),
+    timeoutArg: printTimeoutArg(config.geminiTimeoutMs),
+  });
+  console.log(`Gemini cwd: ${launch.cwd}\n`);
+  const r = await exec(cmd, launch.args, {
+    cwd: launch.cwd,
     timeoutMs: config.geminiTimeoutMs,
     quiet: true,
     maxRetries: config.workerMaxRetries,
@@ -265,30 +271,36 @@ async function antigravity(repo, prompt, model = '') {
   return { text: response, proc: r, usage };
 }
 
-async function cursorAgent(repo, prompt, model = 'auto', readOnly = false, runContext = {}) {
+async function cursorAgent(repo, prompt, model = 'auto', readOnly = false, runContext = {}, exec = executeProcess) {
   console.log(`\n--- CURSOR AGENT (${model}) ---\n`);
-  const trust = shouldTrustCursorWorkspace(repo, runContext);
+  const cwd = requireExplicitCwd(repo, 'cursor');
+  const trust = shouldTrustCursorWorkspace(cwd, runContext);
   if (trust) console.log('Cursor workspace trust: enabled (verified isolated worktree)\n');
   else console.log('Cursor workspace trust: not auto-applied for this path\n');
-  const args = buildCursorAgentArgs({ prompt, model, readOnly, trust });
+  console.log(`Cursor cwd: ${cwd}\n`);
+  const args = buildCursorAgentArgs({ prompt, model, readOnly, trust, workspace: cwd });
   const r = await runCursorAgentCli(args, {
-    cwd: repo,
+    cwd,
     timeoutMs: config.cursorTimeoutMs,
     maxRetries: config.workerMaxRetries,
+    executeProcess: exec,
   });
   throwIfBad(r, 'Cursor Agent');
   return { text: r.stdout, proc: r };
 }
 
-async function codex(repo, prompt, windowsUnelevated, model = '') {
+async function codex(repo, prompt, windowsUnelevated, model = '', exec = executeProcess) {
   console.log('\n--- CODEX ---\n');
   if (model) console.log(`Model: ${model}\n`);
-  const args = [];
-  if (isWin && windowsUnelevated) args.push('-c', 'windows.sandbox="unelevated"');
-  if (model) args.push('-m', model);
-  args.push('--ask-for-approval', 'never', 'exec', '--sandbox', 'workspace-write', '-');
-  const r = await executeProcess(resolveTool('codex'), args, {
+  const launch = buildCodexCliArgs({
+    windowsUnelevated,
+    model,
     cwd: repo,
+    isWin,
+  });
+  console.log(`Codex cwd: ${launch.cwd}\n`);
+  const r = await exec(resolveTool('codex'), launch.args, {
+    cwd: launch.cwd,
     input: prompt,
     timeoutMs: config.codexTimeoutMs,
     maxRetries: config.workerMaxRetries,
@@ -313,10 +325,10 @@ function reviewDecision(review) {
   return 'UNKNOWN';
 }
 
-async function geminiReadOnly(repo, prompt, runDir, model = '') {
+async function geminiReadOnly(repo, prompt, runDir, model = '', exec = executeProcess) {
   const before = await gitState(repo);
   const prefixed = `READ ONLY. DO NOT MODIFY FILES. DO NOT RUN DESTRUCTIVE COMMANDS.\n${prompt}`;
-  const out = await antigravity(repo, prefixed, model);
+  const out = await antigravity(repo, prefixed, model, exec);
   const after = await gitState(repo);
   if (workingTreeChanged(before, after)) {
     await writeFile(path.join(runDir, 'gemini-safety.diff'), after.diff, 'utf8');
@@ -327,9 +339,11 @@ async function geminiReadOnly(repo, prompt, runDir, model = '') {
   return out;
 }
 
-async function independentTests(repo, runDir) {
+async function independentTests(repo, runDir, exec = executeProcess) {
   console.log('\n--- INDEPENDENT TESTS ---\n');
-  const r = await runProjectTests(repo, { timeoutMs: config.testTimeoutMs, quiet: false });
+  const cwd = requireExplicitCwd(repo, 'tests');
+  console.log(`Tests cwd: ${cwd}\n`);
+  const r = await runProjectTests(cwd, { timeoutMs: config.testTimeoutMs, quiet: false, executeProcess: exec });
   const body = [
     `status=${r.status}`,
     `runner=${r.runner || '(none)'}`,
@@ -456,13 +470,15 @@ const meta = {
 const timings = { totalMs: 0, cursorMs: 0, codexMs: 0, testsMs: 0, geminiMs: 0 };
 const stages = [];
 const usageLog = [];
+const workspaceTrace = [];
 const startFingerprint = sourceFingerprint(sourceInfo);
+const exec = options.executeProcess || executeProcess;
 
 let repo = sourceInfo.root;
 let worktree = '';
 let taskBranch = sourceInfo.branch;
 let isolatedMeta = { runId, createdByOrchestrator: false };
-let cursorRunContext = { runId, createdByOrchestrator: false };
+let cursorRunContext = { runId, createdByOrchestrator: false, worktreesRoot: dirs.worktrees };
 const result = {
   route: route.route,
   confidence: route.confidence ?? 1,
@@ -480,18 +496,35 @@ const result = {
   fixRounds: 0,
 };
 
-function addStage(name, status, durationMs) {
-  stages.push({ name, status, durationMs: durationMs || 0 });
+function addStage(name, status, durationMs, extra = {}) {
+  stages.push({ name, status, durationMs: durationMs || 0, ...extra });
+}
+
+async function pinWorkspace(stage) {
+  const identity = await verifyRunWorkspace({
+    workspace: repo,
+    runId: isolatedMeta.runId,
+    expectedBranch: taskBranch,
+    createdByOrchestrator: isolatedMeta.createdByOrchestrator,
+    sourceRoot: sourceInfo.root,
+    inPlace: args.inPlace,
+    worktreesRoot: dirs.worktrees,
+    stage,
+  });
+  const rec = workspaceTraceRecord({ ...identity, sourceRoot: sourceInfo.root });
+  workspaceTrace.push(rec);
+  await writeFile(path.join(runDir, 'workspace-trace.json'), JSON.stringify(workspaceTrace, null, 2), 'utf8');
+  return identity;
 }
 
 try {
   if (!args.inPlace) {
-    const isolated = await createIsolatedWorktree(sourceInfo.root, args.task, args.branch, runId);
+    const isolated = await createIsolatedWorktree(sourceInfo.root, args.task, args.branch, runId, options.env || process.env);
     repo = isolated.worktree;
     worktree = isolated.worktree;
     taskBranch = isolated.branch;
     isolatedMeta = { runId: isolated.runId, createdByOrchestrator: true };
-    cursorRunContext = isolatedMeta;
+    cursorRunContext = { ...isolatedMeta, worktreesRoot: dirs.worktrees };
     result.branch = taskBranch;
     meta.worktree = worktree;
     meta.taskBranch = taskBranch;
@@ -532,71 +565,95 @@ try {
 
   if (route.route === 'CURSOR') {
     result.implementation = 'FAIL';
-    const out = await cursorAgent(repo, sendToWorker('cursor-implementation', codingPrompt), cursorModelId, false, cursorRunContext);
+    const pin = await pinWorkspace('cursor-implementation');
+    const out = await cursorAgent(pin.cwd, sendToWorker('cursor-implementation', codingPrompt), cursorModelId, false, cursorRunContext, exec);
     await writeFile(path.join(runDir, 'implementation.txt'), out.text, 'utf8');
     result.implementation = 'PASS';
     result.implMs = out.proc.durationMs;
     timings.cursorMs += out.proc.durationMs;
-    addStage('cursor-implementation', 'PASS', out.proc.durationMs);
+    addStage('cursor-implementation', 'PASS', out.proc.durationMs, pin);
     usageLog.push(workerUsage({ worker: 'cursor', model: cursorModelId, durationMs: out.proc.durationMs, attempts: out.proc.attempts }));
-    tests = await independentTests(repo, runDir);
+    const testPin = await pinWorkspace('tests');
+    tests = await independentTests(testPin.cwd, runDir, exec);
   } else if (route.route === 'GEMINI') {
     result.review = 'FAIL';
-    const out = await geminiReadOnly(repo, sendToWorker('gemini-analysis', prompts.geminiAnalysis), runDir, geminiModelId);
+    const pin = await pinWorkspace('gemini-analysis');
+    const out = await geminiReadOnly(pin.cwd, sendToWorker('gemini-analysis', prompts.geminiAnalysis), runDir, geminiModelId, exec);
     await writeFile(path.join(runDir, 'review.txt'), out.text, 'utf8');
     result.review = 'PASS';
     result.reviewMs = out.proc.durationMs;
     timings.geminiMs += out.proc.durationMs;
-    addStage('gemini-analysis', 'PASS', out.proc.durationMs);
+    addStage('gemini-analysis', 'PASS', out.proc.durationMs, pin);
     usageLog.push(workerUsage({ worker: 'gemini', model: geminiModelId || 'antigravity', durationMs: out.proc.durationMs, attempts: out.proc.attempts, extra: { usage: out.usage } }));
     console.log('\n\nFINAL (Gemini/Antigravity):\n', out.text);
   } else if (route.route === 'CODEX') {
     result.implementation = 'FAIL';
-    const out = await codex(repo, sendToWorker('codex-implementation', codingPrompt), args.windowsUnelevated, codexModelId);
+    const pin = await pinWorkspace('codex-implementation');
+    const out = await codex(pin.cwd, sendToWorker('codex-implementation', codingPrompt), args.windowsUnelevated, codexModelId, exec);
     await writeFile(path.join(runDir, 'implementation.txt'), out.text, 'utf8');
     result.implementation = 'PASS';
     result.implMs = out.proc.durationMs;
     timings.codexMs += out.proc.durationMs;
-    addStage('codex-implementation', 'PASS', out.proc.durationMs);
+    addStage('codex-implementation', 'PASS', out.proc.durationMs, pin);
     usageLog.push(workerUsage({ worker: 'codex', model: codexModelId || 'codex', durationMs: out.proc.durationMs, attempts: out.proc.attempts }));
-    tests = await independentTests(repo, runDir);
+    const testPin = await pinWorkspace('tests');
+    tests = await independentTests(testPin.cwd, runDir, exec);
   } else {
     result.plan = 'FAIL';
-    const plan = await cursorAgent(repo, sendToWorker('cursor-plan', prompts.plan), cursorModelId, true, cursorRunContext);
+    const planPin = await pinWorkspace('cursor-plan');
+    const plan = await cursorAgent(planPin.cwd, sendToWorker('cursor-plan', prompts.plan), cursorModelId, true, cursorRunContext, exec);
     planText = plan.text;
     await writeFile(path.join(runDir, 'plan.txt'), planText, 'utf8');
     result.plan = 'PASS';
     result.planMs = plan.proc.durationMs;
     timings.cursorMs += plan.proc.durationMs;
-    addStage('cursor-plan', 'PASS', plan.proc.durationMs);
+    addStage('cursor-plan', 'PASS', plan.proc.durationMs, planPin);
     usageLog.push(workerUsage({ worker: 'cursor', model: cursorModelId, durationMs: plan.proc.durationMs, attempts: plan.proc.attempts }));
 
     result.implementation = 'FAIL';
-    const implementation = await codex(repo, sendToWorker('codex-implementation', prompts.implementation(planText)), args.windowsUnelevated, codexModelId);
+    const implPin = await pinWorkspace('codex-implementation');
+    const implementation = await codex(implPin.cwd, sendToWorker('codex-implementation', prompts.implementation(planText)), args.windowsUnelevated, codexModelId, exec);
     implementationText = implementation.text;
     await writeFile(path.join(runDir, 'implementation.txt'), implementationText, 'utf8');
     result.implementation = 'PASS';
     result.implMs = implementation.proc.durationMs;
     timings.codexMs += implementation.proc.durationMs;
-    addStage('codex-implementation', 'PASS', implementation.proc.durationMs);
+    addStage('codex-implementation', 'PASS', implementation.proc.durationMs, implPin);
     usageLog.push(workerUsage({ worker: 'codex', model: codexModelId || 'codex', durationMs: implementation.proc.durationMs, attempts: implementation.proc.attempts }));
 
-    tests = await independentTests(repo, runDir);
+    const testsPin = await pinWorkspace('tests');
+    tests = await independentTests(testsPin.cwd, runDir, exec);
     timings.testsMs += tests.durationMs || 0;
-    addStage('tests', tests.status, tests.durationMs || 0);
+    addStage('tests', tests.status, tests.durationMs || 0, testsPin);
 
     let round = 0;
     let decision = 'UNKNOWN';
     for (;;) {
       if (tests.status === 'PASS' || tests.status === 'SKIP') {
         result.review = 'FAIL';
-        const review = await geminiReadOnly(repo, sendToWorker(round === 0 ? 'gemini-review' : `gemini-review-${round}`, prompts.review), runDir, geminiModelId);
+        const reviewStage = round === 0 ? 'gemini-review' : `gemini-review-${round}`;
+        const reviewPin = await pinWorkspace(reviewStage);
+        const gs = await gitState(reviewPin.cwd);
+        const testsSummary = [
+          `status=${tests.status}`,
+          `runner=${tests.runner || '(none)'}`,
+          `command=${tests.command || '(none)'}`,
+          `exitCode=${tests.exitCode}`,
+          tests.reason ? `reason=${tests.reason}` : '',
+        ].filter(Boolean).join('\n');
+        const reviewPrompt = prompts.review({
+          worktree: reviewPin.cwd,
+          planText,
+          testsSummary,
+          gitDiff: gs.diff,
+        });
+        const review = await geminiReadOnly(reviewPin.cwd, sendToWorker(reviewStage, reviewPrompt), runDir, geminiModelId, exec);
         reviewText = review.text;
         await writeFile(path.join(runDir, 'review.txt'), reviewText, 'utf8');
         decision = reviewDecision(reviewText);
         result.reviewMs = (result.reviewMs || 0) + review.proc.durationMs;
         timings.geminiMs += review.proc.durationMs;
-        addStage(round === 0 ? 'gemini-review' : `gemini-review-${round}`, decision === 'PASS' ? 'PASS' : decision, review.proc.durationMs);
+        addStage(reviewStage, decision === 'PASS' ? 'PASS' : decision, review.proc.durationMs, reviewPin);
         usageLog.push(workerUsage({ worker: 'gemini', model: geminiModelId || 'antigravity', durationMs: review.proc.durationMs, attempts: review.proc.attempts, extra: { usage: review.usage } }));
         console.log(`\n\nREVIEW DECISION: ${decision}\n`);
         if (decision === 'PASS') break;
@@ -622,17 +679,19 @@ try {
         reviewText && decision === 'NEEDS_FIXES' ? `\nA strict reviewer found these issues:\n---\n${reviewText}\n---` : '',
         '\nFix ONLY the material issues. Do not commit or push.',
       ].join('\n');
-      const fix = await codex(repo, sendToWorker(`codex-fix-${round}`, fixPrompt), args.windowsUnelevated, codexFixModelId);
+      const fixPin = await pinWorkspace(`codex-fix-${round}`);
+      const fix = await codex(fixPin.cwd, sendToWorker(`codex-fix-${round}`, fixPrompt), args.windowsUnelevated, codexFixModelId, exec);
       implementationText = fix.text;
       await writeFile(path.join(runDir, `fix-round-${round}.txt`), fix.text, 'utf8');
       result.implementation = 'PASS';
       timings.codexMs += fix.proc.durationMs;
-      addStage(`codex-fix-${round}`, 'PASS', fix.proc.durationMs);
+      addStage(`codex-fix-${round}`, 'PASS', fix.proc.durationMs, fixPin);
       usageLog.push(workerUsage({ worker: 'codex', model: codexFixModelId || 'codex', durationMs: fix.proc.durationMs, attempts: fix.proc.attempts }));
 
-      tests = await independentTests(repo, runDir);
+      const fixTestsPin = await pinWorkspace(`tests-${round}`);
+      tests = await independentTests(fixTestsPin.cwd, runDir, exec);
       timings.testsMs += tests.durationMs || 0;
-      addStage(`tests-${round}`, tests.status, tests.durationMs || 0);
+      addStage(`tests-${round}`, tests.status, tests.durationMs || 0, fixTestsPin);
     }
 
     result.fixRounds = round;
@@ -653,7 +712,7 @@ try {
 
   if (route.route !== 'TEAM') {
     timings.testsMs += tests.durationMs || 0;
-    if (route.route !== 'GEMINI') addStage('tests', tests.status, tests.durationMs || 0);
+    if (route.route !== 'GEMINI') addStage('tests', tests.status, tests.durationMs || 0, { cwd: repo, runId: isolatedMeta.runId });
   }
 
   result.tests = tests.status;
@@ -711,6 +770,7 @@ try {
         worktree,
         runId: isolatedMeta.runId,
         createdByOrchestrator: true,
+        env: options.env || process.env,
       });
       worktreeState = rm.removed ? 'CLEANED' : `PRESERVED (${rm.reason})`;
     }
@@ -724,6 +784,7 @@ try {
   meta.worktreeState = worktreeState;
   await writeFile(path.join(runDir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'timings.json'), JSON.stringify(timings, null, 2), 'utf8');
+  await writeFile(path.join(runDir, 'workspace-trace.json'), JSON.stringify(workspaceTrace, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'stages.json'), JSON.stringify(stages, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'usage.json'), JSON.stringify(usageLog, null, 2), 'utf8');
 
@@ -737,6 +798,7 @@ try {
   const st = err?.stageStatus;
   if (!result.failedStage) {
     if (st === 'TIMEOUT') result.failedStage = 'TIMEOUT';
+    else if (err instanceof WorkspaceSafetyError) result.failedStage = 'SAFETY FAILURE';
     else if (st === 'SAFETY') result.failedStage = 'SAFETY VIOLATION';
     else if (result.plan === 'FAIL') result.failedStage = 'Cursor Plan';
     else if (result.implementation === 'FAIL') result.failedStage = route.route === 'CURSOR' ? 'Cursor Implementation' : 'Codex Implementation';
@@ -749,12 +811,13 @@ try {
   await writeFile(path.join(runDir, 'meta.json'), JSON.stringify({ ...meta, error: msg }, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'timings.json'), JSON.stringify(timings, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'stages.json'), JSON.stringify(stages, null, 2), 'utf8');
+  await writeFile(path.join(runDir, 'workspace-trace.json'), JSON.stringify(workspaceTrace, null, 2), 'utf8');
   console.error('\nFAILED:\n', msg);
   console.log(summaryBlock(result));
   if (worktree) console.error(`\nThe isolated worktree was kept for debugging:\n${worktree}`);
   process.exitCode = 1;
   return 1;
-  }
+}
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

@@ -73,7 +73,9 @@ export function detectTestCommand(repo) {
   return { detected: false, runner: '', command: '', argv: null };
 }
 
-export async function runProjectTests(repo, { timeoutMs = config.testTimeoutMs, quiet = false } = {}) {
+export async function runProjectTests(repo, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? config.testTimeoutMs;
+  const quiet = opts.quiet === true;
   const detected = detectTestCommand(repo);
   if (!detected.detected) {
     return {
@@ -89,7 +91,8 @@ export async function runProjectTests(repo, { timeoutMs = config.testTimeoutMs, 
     };
   }
   const [command, args] = detected.argv;
-  const r = await executeProcess(command, args, {
+  const exec = opts.executeProcess || executeProcess;
+  const r = await exec(command, args, {
     cwd: repo,
     timeoutMs,
     quiet,

@@ -18,7 +18,7 @@
     "task": "node src/orchestrator.mjs",
     "cleanup": "node src/cleanup.mjs",
     "cli": "node bin/ai-orchestrator.mjs",
-    "test": "node --test src/router.test.mjs src/tooling.test.mjs src/workspace.test.mjs src/cursor-agent.test.mjs src/test-runner.test.mjs src/process.test.mjs src/cleanup.test.mjs src/cli.test.mjs src/config.test.mjs src/skills.test.mjs src/paths.test.mjs src/task-input.test.mjs src/team-loop.test.mjs src/model-registry.test.mjs src/model-discovery.test.mjs src/model-policy.test.mjs src/model-cache.test.mjs src/model-select.test.mjs"
+    "test": "node --test src/router.test.mjs src/tooling.test.mjs src/workspace.test.mjs src/cursor-agent.test.mjs src/test-runner.test.mjs src/process.test.mjs src/cleanup.test.mjs src/cli.test.mjs src/config.test.mjs src/skills.test.mjs src/paths.test.mjs src/task-input.test.mjs src/team-loop.test.mjs src/model-registry.test.mjs src/model-discovery.test.mjs src/model-policy.test.mjs src/model-cache.test.mjs src/model-select.test.mjs src/workspace-context.test.mjs"
   },
   "engines": {
     "node": ">=20"

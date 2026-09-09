@@ -54,6 +54,26 @@ test('npm test FAIL is determined from non-zero exit code', async () => {
   }
 });
 
+test('runProjectTests uses injected executeProcess cwd', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai orch execcwd '));
+  const seen = [];
+  try {
+    await writeFile(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', scripts: { test: 'node -e "process.exit(0)"' } }), 'utf8');
+    const r = await runProjectTests(dir, {
+      timeoutMs: 5_000,
+      quiet: true,
+      executeProcess: async (command, args, opts) => {
+        seen.push({ command, args, cwd: opts.cwd });
+        return { exitCode: 0, timedOut: false, stdout: '', stderr: '', durationMs: 1 };
+      },
+    });
+    assert.equal(r.status, 'PASS');
+    assert.equal(path.resolve(seen[0].cwd), path.resolve(dir));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('no test runner yields SKIP not PASS', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-skip-'));
   try {

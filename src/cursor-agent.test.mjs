@@ -25,6 +25,14 @@ test('verified orchestrator worktree gets --trust', async () => {
       trust: true,
     });
     assert.deepEqual(args, ['--trust', '--model', 'auto', '--output-format', 'text', '-p', 'line1\nline2']);
+    const withWs = buildCursorAgentArgs({
+      prompt: 'line1\nline2',
+      model: 'auto',
+      readOnly: false,
+      trust: true,
+      workspace: worktree,
+    });
+    assert.deepEqual(withWs, ['--trust', '--workspace', worktree, '--model', 'auto', '--output-format', 'text', '-p', 'line1\nline2']);
     assert.ok(args.indexOf('--trust') < args.indexOf('-p'));
     assert.ok(!args.includes('--yolo'));
     assert.ok(!args.includes('-f'));
