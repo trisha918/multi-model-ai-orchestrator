@@ -1,4 +1,5 @@
 import { mkdir, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import process from 'node:process';
 import { isWin, resolveTool, VERSION } from './tooling.mjs';
@@ -15,15 +16,21 @@ import {
   sourceFingerprint,
   workingTreeChanged,
   removeOrchestratorWorktree,
+  resolveTaskRepo,
 } from './workspace.mjs';
 import { buildCursorAgentArgs, runCursorAgentCli } from './cursor-agent.mjs';
 import { executeProcess } from './process.mjs';
 import { runProjectTests } from './test-runner.mjs';
-import { config } from './config.mjs';
+import { loadResolvedConfig, loadConfig } from './config.mjs';
+import { resolveTaskInput, TaskInputError } from './task-input.mjs';
+import { workerPrompts } from './prompts.mjs';
+import { teamLoopShouldStartFix } from './team-loop.mjs';
 
-function parseArgs(argv) {
+let config = loadConfig();
+
+export function parseTaskArgs(argv, defaults = {}) {
   const out = {
-    mode: 'auto',
+    mode: defaults.defaultMode || 'auto',
     repo: '',
     task: '',
     windowsUnelevated: false,
@@ -31,20 +38,38 @@ function parseArgs(argv) {
     inPlace: false,
     commitOnPass: false,
     branch: '',
-    cursorModel: 'auto',
+    cursorModel: defaults.cursorModel || 'auto',
+    provided: { mode: false, cursorModel: false, task: false, taskFile: false, taskStdin: false },
+    taskFile: '',
+    taskStdin: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--repo') out.repo = argv[++i] ?? '';
-    else if (a === '--task') out.task = argv[++i] ?? '';
-    else if (a === '--mode') out.mode = argv[++i] ?? 'auto';
-    else if (a === '--windows-unelevated') out.windowsUnelevated = true;
+    else if (a === '--task') {
+      out.task = argv[++i] ?? '';
+      out.provided.task = true;
+    } else if (a === '--task-file') {
+      out.taskFile = argv[++i] ?? '';
+      out.provided.taskFile = true;
+    } else if (a === '--task-stdin') {
+      out.taskStdin = true;
+      out.provided.taskStdin = true;
+    } else if (a === '--mode') {
+      out.mode = argv[++i] ?? 'auto';
+      out.provided.mode = true;
+    } else if (a === '--windows-unelevated') out.windowsUnelevated = true;
     else if (a === '--max-fix-rounds') out.maxFixRounds = Math.max(0, Math.min(5, Number(argv[++i] ?? 2)));
     else if (a === '--in-place') out.inPlace = true;
     else if (a === '--commit-on-pass') out.commitOnPass = true;
     else if (a === '--branch') out.branch = argv[++i] ?? '';
-    else if (a === '--cursor-model') out.cursorModel = argv[++i] ?? 'auto';
+    else if (a === '--cursor-model') {
+      out.cursorModel = argv[++i] ?? 'auto';
+      out.provided.cursorModel = true;
+    }
   }
+  if (!out.provided.mode && defaults.defaultMode) out.mode = defaults.defaultMode;
+  if (!out.provided.cursorModel && defaults.cursorModel) out.cursorModel = defaults.cursorModel;
   return out;
 }
 
@@ -283,41 +308,67 @@ async function independentTests(repo, runDir) {
   return r;
 }
 
-const args = parseArgs(process.argv.slice(2));
-if (!args.repo || !args.task) {
-  console.error('Usage: npm run task -- --repo "C:\\path\\to\\repo" --task "Your task" [--mode auto|cursor|codex|gemini|agy|team] [--max-fix-rounds 2] [--commit-on-pass] [--branch ai/my-task] [--in-place] [--windows-unelevated]');
-  process.exit(2);
-}
+export async function runTask(argv = process.argv.slice(2), options = {}) {
+  config = options.config || await loadResolvedConfig(options.env || process.env);
+  const args = parseTaskArgs(argv, config);
+  try {
+    args.task = await resolveTaskInput(args, { stdin: options.stdin || process.stdin });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(msg);
+    if (e instanceof TaskInputError && /Missing task/.test(msg)) {
+      console.error('Usage: ai-orchestrator run --repo "<git-root>" (--task "Your task" | --task-file <path> | --task-stdin) [--mode auto|cursor|codex|gemini|agy|team] [--max-fix-rounds 2] [--commit-on-pass] [--branch ai/my-task] [--in-place] [--windows-unelevated]');
+      console.error('Also: npm run task -- --repo "<git-root>" --task "Your task" ...');
+    }
+    process.exitCode = e instanceof TaskInputError ? e.exitCode : 2;
+    return process.exitCode;
+  }
 
-let route;
-try {
-  route = resolveRoute(args.task, args.mode);
-} catch (e) {
-  console.error(e instanceof Error ? e.message : String(e));
-  process.exit(2);
-}
+  if ((options.env || process.env).AI_ORCHESTRATOR_PRINT_TASK_AND_EXIT === '1' || options.printTaskAndExit) {
+    process.stdout.write(args.task);
+    return 0;
+  }
 
-let sourceInfo;
-try {
-  sourceInfo = await inspectSourceRepo(args.repo);
-} catch (e) {
-  console.error(e instanceof Error ? e.message : String(e));
-  process.exit(2);
-}
+  try {
+    args.repo = await resolveTaskRepo(args.repo, options.cwd || process.cwd());
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exitCode = 2;
+    return 2;
+  }
 
-if (!args.inPlace && sourceInfo.status.trim()) {
-  console.error('\nREFUSED: source repository has uncommitted changes.');
-  console.error('Nothing was discarded, reset, or cleaned.');
-  console.error('Commit or stash these files, then retry. Isolation will not silently ignore local edits.\n');
-  console.error(formatDirtyFiles(sourceInfo.status));
-  process.exit(3);
-}
+  let route;
+  try {
+    route = resolveRoute(args.task, args.mode);
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exitCode = 2;
+    return 2;
+  }
 
-const startedAt = Date.now();
-const runId = makeRunId(args.task);
-const dirs = runtimeDirs();
-const runDir = path.join(dirs.runs, runId);
-await mkdir(runDir, { recursive: true });
+  let sourceInfo;
+  try {
+    sourceInfo = await inspectSourceRepo(args.repo);
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exitCode = 2;
+    return 2;
+  }
+
+  if (!args.inPlace && sourceInfo.status.trim()) {
+    console.error('\nREFUSED: source repository has uncommitted changes.');
+    console.error('Nothing was discarded, reset, or cleaned.');
+    console.error('Commit or stash these files, then retry. Isolation will not silently ignore local edits.\n');
+    console.error(formatDirtyFiles(sourceInfo.status));
+    process.exitCode = 3;
+    return 3;
+  }
+
+  const startedAt = Date.now();
+  const runId = makeRunId(args.task);
+  const dirs = runtimeDirs(options.env || process.env);
+  const runDir = path.join(dirs.runs, runId);
+  await mkdir(runDir, { recursive: true });
 
 const routeRecord = {
   route: route.route,
@@ -407,11 +458,16 @@ try {
   let tests = { status: 'SKIP', reason: 'Not a modifying route', durationMs: 0, command: '', runner: '', exitCode: null };
   let finalDecision = 'SUCCESS';
 
-  const codingPrompt = `Work on this repository task end-to-end: ${args.task}\nRead AGENTS.md if present. Make only relevant changes. Do not commit or push. Finish with a concise summary of changes. Independent tests will be run by the orchestrator.`;
+  const prompts = workerPrompts(args.task);
+  const codingPrompt = prompts.coding;
+  const sendToWorker = (kind, text) => {
+    if (typeof options.onWorkerPrompt === 'function') options.onWorkerPrompt({ kind, text });
+    return text;
+  };
 
   if (route.route === 'CURSOR') {
     result.implementation = 'FAIL';
-    const out = await cursorAgent(repo, codingPrompt, args.cursorModel, false, cursorRunContext);
+    const out = await cursorAgent(repo, sendToWorker('cursor-implementation', codingPrompt), args.cursorModel, false, cursorRunContext);
     await writeFile(path.join(runDir, 'implementation.txt'), out.text, 'utf8');
     result.implementation = 'PASS';
     result.implMs = out.proc.durationMs;
@@ -421,7 +477,7 @@ try {
     tests = await independentTests(repo, runDir);
   } else if (route.route === 'GEMINI') {
     result.review = 'FAIL';
-    const out = await geminiReadOnly(repo, `You are the analysis/review agent for this repository. Read relevant repository files. Task: ${args.task}\nReturn a concise, actionable answer.`, runDir);
+    const out = await geminiReadOnly(repo, sendToWorker('gemini-analysis', prompts.geminiAnalysis), runDir);
     await writeFile(path.join(runDir, 'review.txt'), out.text, 'utf8');
     result.review = 'PASS';
     result.reviewMs = out.proc.durationMs;
@@ -431,7 +487,7 @@ try {
     console.log('\n\nFINAL (Gemini/Antigravity):\n', out.text);
   } else if (route.route === 'CODEX') {
     result.implementation = 'FAIL';
-    const out = await codex(repo, codingPrompt, args.windowsUnelevated);
+    const out = await codex(repo, sendToWorker('codex-implementation', codingPrompt), args.windowsUnelevated);
     await writeFile(path.join(runDir, 'implementation.txt'), out.text, 'utf8');
     result.implementation = 'PASS';
     result.implMs = out.proc.durationMs;
@@ -441,7 +497,7 @@ try {
     tests = await independentTests(repo, runDir);
   } else {
     result.plan = 'FAIL';
-    const plan = await cursorAgent(repo, `Act as a senior software architect. READ ONLY. Do NOT modify files. Create an implementation plan for this task: ${args.task}\nInclude risks, files likely affected, and verification steps. Keep it practical for another coding agent.`, args.cursorModel, true, cursorRunContext);
+    const plan = await cursorAgent(repo, sendToWorker('cursor-plan', prompts.plan), args.cursorModel, true, cursorRunContext);
     planText = plan.text;
     await writeFile(path.join(runDir, 'plan.txt'), planText, 'utf8');
     result.plan = 'PASS';
@@ -451,7 +507,7 @@ try {
     usageLog.push(workerUsage({ worker: 'cursor', model: args.cursorModel, durationMs: plan.proc.durationMs, attempts: plan.proc.attempts }));
 
     result.implementation = 'FAIL';
-    const implementation = await codex(repo, `Implement this task: ${args.task}\n\nA planning agent produced this plan:\n---\n${planText}\n---\nRead AGENTS.md if present. Validate the plan against the actual code. Make only relevant changes. Do not commit or push. Independent tests will be run by the orchestrator.`, args.windowsUnelevated);
+    const implementation = await codex(repo, sendToWorker('codex-implementation', prompts.implementation(planText)), args.windowsUnelevated);
     implementationText = implementation.text;
     await writeFile(path.join(runDir, 'implementation.txt'), implementationText, 'utf8');
     result.implementation = 'PASS';
@@ -469,7 +525,7 @@ try {
     for (;;) {
       if (tests.status === 'PASS' || tests.status === 'SKIP') {
         result.review = 'FAIL';
-        const review = await geminiReadOnly(repo, `Act as a strict code reviewer. The task was: ${args.task}\nReview the CURRENT repository state and git changes. READ ONLY. DO NOT MODIFY FILES. Check correctness, security, missing tests, regressions, and scope creep.\nYour FIRST non-empty line MUST be exactly one of:\nPASS\nNEEDS_FIXES\nIf NEEDS_FIXES, follow it with concrete, actionable fixes. If PASS, briefly state why.`, runDir);
+        const review = await geminiReadOnly(repo, sendToWorker(round === 0 ? 'gemini-review' : `gemini-review-${round}`, prompts.review), runDir);
         reviewText = review.text;
         await writeFile(path.join(runDir, 'review.txt'), reviewText, 'utf8');
         decision = reviewDecision(reviewText);
@@ -483,21 +539,25 @@ try {
         decision = 'TESTS_FAIL';
       }
 
-      if (round >= args.maxFixRounds) break;
-      if (decision !== 'NEEDS_FIXES' && tests.status !== 'FAIL' && tests.status !== 'TIMEOUT') break;
+      if (!teamLoopShouldStartFix({
+        testsStatus: tests.status,
+        decision,
+        round,
+        maxFixRounds: args.maxFixRounds,
+      })) break;
 
       round += 1;
       console.log(`\n=== AUTO-FIX ROUND ${round}/${args.maxFixRounds} ===\n`);
       result.implementation = 'FAIL';
       const fixPrompt = [
-        `The original task is: ${args.task}`,
+        prompts.fixHeader,
         planText ? `\nPlan:\n---\n${planText}\n---` : '',
         `\nCurrent implementation context:\n---\n${implementationText}\n---`,
         tests.status === 'FAIL' || tests.status === 'TIMEOUT' ? `\nIndependent tests ${tests.status}. Command: ${tests.command}\nExit code: ${tests.exitCode}\nOutput:\n${tests.stdout}\n${tests.stderr}` : '',
         reviewText && decision === 'NEEDS_FIXES' ? `\nA strict reviewer found these issues:\n---\n${reviewText}\n---` : '',
         '\nFix ONLY the material issues. Do not commit or push.',
       ].join('\n');
-      const fix = await codex(repo, fixPrompt, args.windowsUnelevated);
+      const fix = await codex(repo, sendToWorker(`codex-fix-${round}`, fixPrompt), args.windowsUnelevated);
       implementationText = fix.text;
       await writeFile(path.join(runDir, `fix-round-${round}.txt`), fix.text, 'utf8');
       result.implementation = 'PASS';
@@ -627,5 +687,13 @@ try {
   console.error('\nFAILED:\n', msg);
   console.log(summaryBlock(result));
   if (worktree) console.error(`\nThe isolated worktree was kept for debugging:\n${worktree}`);
-  process.exit(1);
+  process.exitCode = 1;
+  return 1;
+  }
+}
+
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  const code = await runTask(process.argv.slice(2));
+  if (typeof code === 'number' && code !== 0) process.exit(code);
 }

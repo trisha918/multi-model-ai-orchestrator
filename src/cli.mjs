@@ -1,0 +1,207 @@
+import process from 'node:process';
+import { VERSION } from './tooling.mjs';
+import { runTask, parseTaskArgs } from './orchestrator.mjs';
+import { runDoctor } from './doctor.mjs';
+import { runCleanupCli } from './cleanup.mjs';
+import {
+  CONFIG_PRECEDENCE,
+  loadResolvedConfig,
+  readUserConfigFile,
+  writeUserConfigFile,
+  USER_CONFIG_KEYS,
+  validateConfigValue,
+} from './config.mjs';
+import { userConfigPath, installationInfo } from './paths.mjs';
+import { installSkills, uninstallSkills } from './skills.mjs';
+
+export const COMMANDS = ['doctor', 'version', 'run', 'cleanup', 'config', 'install-skills', 'uninstall-skills'];
+
+export function printVersion() {
+  return `Multi-Model AI Orchestrator v${VERSION}`;
+}
+
+export function parseCli(argv) {
+  const args = [...argv];
+  if (args.length === 1 && /^run\s+--/.test(args[0])) {
+    return {
+      command: 'unknown',
+      argv: args,
+      error: 'CLI arguments were collapsed into a single string. Re-run .\\install.ps1 so the PowerShell shim uses @args, then pass separate arguments such as run, --repo, and --task. Do not interpolate the task into one command line.',
+    };
+  }
+  if (args.length === 0) {
+    return { command: 'help', argv: [], flags: {} };
+  }
+
+  if (args[0] === '--version' || args[0] === '-v') {
+    return { command: 'version', argv: [], flags: { version: true } };
+  }
+  if (args[0] === '--help' || args[0] === '-h') {
+    return { command: 'help', argv: [], flags: {} };
+  }
+
+  const command = args[0];
+  const rest = args.slice(1);
+
+  if (command === 'version') return { command: 'version', argv: rest, flags: {} };
+  if (command === 'doctor') return { command: 'doctor', argv: rest, flags: {} };
+  if (command === 'run') return { command: 'run', argv: rest, flags: {}, taskArgs: parseTaskArgs(rest) };
+  if (command === 'cleanup') return { command: 'cleanup', argv: rest, flags: {} };
+  if (command === 'install-skills') return { command: 'install-skills', argv: rest, flags: {} };
+  if (command === 'uninstall-skills') return { command: 'uninstall-skills', argv: rest, flags: {} };
+  if (command === 'config') {
+    const sub = rest[0] || 'show';
+    return {
+      command: 'config',
+      argv: rest,
+      subcommand: sub,
+      key: rest[1],
+      value: rest.slice(2).join(' '),
+    };
+  }
+
+  if (command.startsWith('--')) {
+    return { command: 'unknown', argv: args, error: `Unknown option: ${command}` };
+  }
+
+  return { command: 'unknown', argv: args, error: `Unknown command: ${command}` };
+}
+
+export function helpText() {
+  return [
+    printVersion(),
+    '',
+    'Usage:',
+    '  ai-orchestrator <command>',
+    '',
+    'Commands:',
+    '  doctor              Check tools, auth, skills, config, and runtime paths',
+    '  version             Print the package version',
+    '  run                 Run a task (same flags as npm run task)',
+    '  cleanup             List or delete old runs/worktrees (dry-run unless --apply)',
+    '  config show         Show effective configuration',
+    '  config path         Print the user config.json path',
+    '  config set <k> <v>  Write a validated user setting',
+    '  install-skills      Install global /ai and /ai-team Cursor skills',
+    '  uninstall-skills    Remove project-owned /ai and /ai-team skills',
+    '',
+    'Run flags:',
+    '  --repo <git-root>   Target repository (defaults to Git root of the current directory)',
+    '  --task <text>       Task text (verbatim; optional if --task-file or --task-stdin)',
+    '  --task-file <path>  Read task as UTF-8 from a file (Cursor skills use this)',
+    '  --task-stdin        Read task as UTF-8 from stdin',
+    '  --mode auto|cursor|codex|gemini|agy|team',
+    '  --commit-on-pass    --cursor-model --max-fix-rounds --branch --in-place --windows-unelevated',
+    '',
+    `Config precedence: ${CONFIG_PRECEDENCE.join(' → ')}`,
+    '',
+    'There is no ai-orchestrator update in v0.9. To update a Git clone:',
+    '  git pull',
+    '  npm install',
+    '  .\\install.ps1',
+  ].join('\n');
+}
+
+async function cmdConfig(parsed) {
+  const sub = parsed.subcommand || 'show';
+  if (sub === 'path') {
+    console.log(userConfigPath());
+    return 0;
+  }
+  if (sub === 'show') {
+    const effective = await loadResolvedConfig();
+    const file = await readUserConfigFile();
+    const info = installationInfo();
+    console.log(JSON.stringify({
+      precedence: CONFIG_PRECEDENCE,
+      configPath: info.configPath,
+      userFile: file,
+      effective: {
+        defaultMode: effective.defaultMode,
+        cursorModel: effective.cursorModel,
+        keepSuccessWorktrees: effective.keepSuccessWorktrees,
+        keepFailedWorktrees: effective.keepFailedWorktrees,
+        workerMaxRetries: effective.workerMaxRetries,
+        cursorTimeoutMs: effective.cursorTimeoutMs,
+        codexTimeoutMs: effective.codexTimeoutMs,
+        geminiTimeoutMs: effective.geminiTimeoutMs,
+        testTimeoutMs: effective.testTimeoutMs,
+      },
+    }, null, 2));
+    return 0;
+  }
+  if (sub === 'set') {
+    if (!parsed.key || parsed.value === '') {
+      console.error('Usage: ai-orchestrator config set <key> <value>');
+      console.error(`Keys: ${USER_CONFIG_KEYS.join(', ')}`);
+      return 2;
+    }
+    try {
+      validateConfigValue(parsed.key, parsed.value);
+      const written = await writeUserConfigFile({ [parsed.key]: parsed.value });
+      console.log(`Wrote ${parsed.key} to ${written.path}`);
+      return 0;
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      return 2;
+    }
+  }
+  console.error(`Unknown config subcommand: ${sub}`);
+  return 2;
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  const parsed = parseCli(argv);
+  if (parsed.command === 'help') {
+    console.log(helpText());
+    return 0;
+  }
+  if (parsed.command === 'unknown') {
+    console.error(parsed.error || 'Unknown command');
+    console.error(helpText());
+    return 2;
+  }
+  if (parsed.command === 'version') {
+    console.log(printVersion());
+    return 0;
+  }
+  if (parsed.command === 'doctor') {
+    const report = await runDoctor();
+    return report.failed ? 1 : 0;
+  }
+  if (parsed.command === 'run') {
+    const code = await runTask(parsed.argv);
+    return typeof code === 'number' ? code : (process.exitCode || 0);
+  }
+  if (parsed.command === 'cleanup') {
+    runCleanupCli(parsed.argv);
+    return 0;
+  }
+  if (parsed.command === 'config') {
+    return cmdConfig(parsed);
+  }
+  if (parsed.command === 'install-skills') {
+    const results = await installSkills();
+    for (const r of results) {
+      if (r.status === 'installed') console.log(`Installed /${r.name} -> ${r.path}`);
+      else console.error(`/${r.name}: ${r.message || r.status}`);
+    }
+    if (results.some(r => r.status === 'skipped-foreign')) return 2;
+    console.log('\nRestart Cursor (or reload the window), then type /ai or /ai-team in Agent chat.');
+    return 0;
+  }
+  if (parsed.command === 'uninstall-skills') {
+    const results = await uninstallSkills();
+    for (const r of results) {
+      if (r.status === 'removed') console.log(`Removed /${r.name}`);
+      else if (r.status === 'missing') console.log(`/${r.name} was not installed`);
+      else console.error(`/${r.name}: ${r.message || r.status}`);
+    }
+    if (results.some(r => r.status === 'skipped-foreign')) return 2;
+    return 0;
+  }
+  console.error(`Unknown command: ${parsed.command}`);
+  return 2;
+}
+
+export { parseTaskArgs };

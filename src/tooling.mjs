@@ -1,11 +1,10 @@
 import { spawn } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 export const isWin = process.platform === 'win32';
-export const VERSION = '0.8.0';
 
 const WIN_EXECUTABLE_EXTS = ['.exe', '.cmd', '.bat', '.com'];
 
@@ -16,6 +15,17 @@ export function srcDir() {
 export function packageRoot() {
   return path.resolve(srcDir(), '..');
 }
+
+let cachedVersion = '';
+
+export function packageVersion() {
+  if (cachedVersion) return cachedVersion;
+  const pkg = JSON.parse(readFileSync(path.join(packageRoot(), 'package.json'), 'utf8'));
+  cachedVersion = String(pkg.version || '0.0.0');
+  return cachedVersion;
+}
+
+export const VERSION = packageVersion();
 
 function pathDirs() {
   return (process.env.PATH || '')
@@ -82,13 +92,13 @@ function newestCursorAgentCmd() {
   return '';
 }
 
-function npmGlobalBin() {
-  if (isWin && process.env.APPDATA) {
-    const dir = path.join(process.env.APPDATA, 'npm');
+export function npmGlobalBin(env = process.env) {
+  if (isWin && env.APPDATA) {
+    const dir = path.join(env.APPDATA, 'npm');
     if (existsSync(dir)) return dir;
   }
-  if (!isWin && process.env.HOME) {
-    const dir = path.join(process.env.HOME, '.npm-global', 'bin');
+  if (!isWin && env.HOME) {
+    const dir = path.join(env.HOME, '.npm-global', 'bin');
     if (existsSync(dir)) return dir;
   }
   return '';
@@ -135,7 +145,7 @@ export function resolveTool(name) {
   }
 
   if (name === 'codex') {
-    const globalBin = npmGlobalBin();
+    const globalBin = npmGlobalBin(process.env);
     const fromGlobal = globalBin
       ? (isWin ? existingPath(globalBin, 'codex.cmd') : existingPath(globalBin, 'codex'))
       : '';

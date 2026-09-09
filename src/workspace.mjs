@@ -2,18 +2,12 @@ import { existsSync, realpathSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { isWin, packageRoot, runTool } from './tooling.mjs';
+import { isWin, runTool } from './tooling.mjs';
+import { runtimeDirs } from './paths.mjs';
+
+export { runtimeDirs };
 
 const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
-
-export function runtimeDirs() {
-  const root = packageRoot();
-  return {
-    root,
-    runs: path.join(root, 'runs'),
-    worktrees: path.join(root, 'worktrees'),
-  };
-}
 
 export function canonicalPath(input) {
   const resolved = path.resolve(String(input || ''));
@@ -74,6 +68,22 @@ export async function git(repo, args, { quiet = true } = {}) {
 
 export async function gitAllowFail(repo, args) {
   return runTool('git', args, { cwd: repo, timeoutMs: 120_000, quiet: true });
+}
+
+export async function resolveGitRootFromCwd(cwd = process.cwd()) {
+  const candidate = path.resolve(cwd);
+  const inside = await gitAllowFail(candidate, ['rev-parse', '--is-inside-work-tree']);
+  if (inside.code !== 0 || inside.stdout.trim() !== 'true') {
+    throw new Error(`Current folder is not inside a Git repository:\n${candidate}\nOpen the project repo in Cursor and retry. The orchestrator will not guess another repository.`);
+  }
+  return path.resolve(await git(candidate, ['rev-parse', '--show-toplevel']));
+}
+
+export async function resolveTaskRepo(repoFlag, cwd = process.cwd()) {
+  if (repoFlag && String(repoFlag).trim()) {
+    return path.resolve(String(repoFlag).trim());
+  }
+  return resolveGitRootFromCwd(cwd);
 }
 
 export async function inspectSourceRepo(repo) {
