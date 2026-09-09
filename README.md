@@ -4,6 +4,8 @@ A local multi-model coding orchestrator for Cursor that routes development tasks
 
 Current version: **v1.0.0**
 
+[![CI](https://github.com/trisha918/multi-model-ai-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/trisha918/multi-model-ai-orchestrator/actions/workflows/ci.yml)
+
 **Validated platform: Windows.** macOS and Linux are not claimed and have not been tested as supported hosts.
 
 ## Quick Start
@@ -41,6 +43,10 @@ or:
 ```
 
 You should not need to know where this repository was cloned. Cursor skills call the global `ai-orchestrator` command, not an absolute clone path.
+
+## Release
+
+Release notes for **v1.0.0** (smart worker and model routing, TEAM workspace pinning, portable installer): [docs/releases/v1.0.0.md](docs/releases/v1.0.0.md).
 
 ## Overview
 
@@ -466,11 +472,7 @@ Clone paths such as `C:\AI Tools\multi-model-ai-orchestrator` and project paths 
 
 ## Contributing
 
-1. Fork and branch from `main`.
-2. Keep Windows-first spawning (`shell: false`, argument arrays; wrap `.cmd` via `cmd.exe /d /s /c`).
-3. Run `npm test` and `npm run doctor`.
-4. Do not commit `runs/`, `worktrees/`, `.env`, credentials, or generated logs.
-5. Open a pull request. Do not push, merge, or deploy from the orchestrator itself.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Create a branch from `main`, run `npm test`, keep Windows-safe spawning and `--task-file` transport, and do not commit `runs/`, `worktrees/`, or secrets.
 
 ## License
 

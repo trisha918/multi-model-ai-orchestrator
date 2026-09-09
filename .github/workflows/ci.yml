@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Windows Node tests
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check
+        shell: pwsh
+        run: |
+          Get-ChildItem src/*.mjs, bin/*.mjs | ForEach-Object {
+            node --check $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "node --check failed: $($_.Name)" }
+          }
+
+      - name: Unit tests
+        run: npm test

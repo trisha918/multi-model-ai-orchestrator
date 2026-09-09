@@ -49,6 +49,7 @@ coverage/
 .tmp/
 tmp/
 temp/
+**/task-inbox/
 *.tmp
 *.swp
 *~
