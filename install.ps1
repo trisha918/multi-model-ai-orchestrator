@@ -83,6 +83,13 @@ try {
 
   Write-Host ''
   Write-Host 'Linking global command ai-orchestrator (npm link)...'
+  $NpmPrefix = (& npm prefix -g).Trim()
+  if ($NpmPrefix) {
+    $ExistingShim = Join-Path $NpmPrefix 'ai-orchestrator.ps1'
+    if (Test-Path -LiteralPath $ExistingShim) {
+      Remove-Item -LiteralPath $ExistingShim -Force
+    }
+  }
   npm link
   if ($LASTEXITCODE -ne 0) { throw 'npm link failed' }
 
