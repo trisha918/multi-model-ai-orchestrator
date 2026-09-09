@@ -30,6 +30,13 @@ test('HTTP client uses injected fetch and redacts secrets', async () => {
   const client = createGithubClient({ env: { GITHUB_TOKEN: 'ghp_LIVESECRET' }, fetchImpl });
   const issue = await client.getIssue('o', 'r', 9);
   assert.equal(issue.number, 9);
+  const fetch404 = async () => ({
+    ok: false,
+    status: 404,
+    text: async () => 'Not Found',
+  });
+  const missing = createGithubClient({ env: { GITHUB_TOKEN: 'ghp_LIVESECRET' }, fetchImpl: fetch404 });
+  assert.equal(await missing.getBranch('o', 'r', 'ai/missing'), null);
   assert.equal(calls[0].auth, 'Bearer ghp_LIVESECRET');
   assert.match(redactGithubText('token: ghp_LIVESECRET'), /redacted/);
   assert.doesNotMatch(redactGithubText('token: ghp_LIVESECRET'), /LIVESECRET/);

@@ -121,7 +121,7 @@ export async function defaultRunImplementation({
 export async function defaultGitPush({ branch, repo }) {
   if (!repo) throw new Error('Missing local repository for git push');
   await git(repo, ['push', '-u', 'origin', branch]);
-  const sha = await git(repo, ['rev-parse', 'HEAD']);
+  const sha = await git(repo, ['rev-parse', branch]);
   return { sha };
 }
 
@@ -154,6 +154,7 @@ export async function cmdGithub(parsed, {
   clientFactory = buildLiveClient,
   runImplementation = defaultRunImplementation,
   gitPush = defaultGitPush,
+  waitForCi,
 } = {}) {
   if (parsed.help || parsed.error) {
     if (parsed.error) stderr(parsed.error);
@@ -261,7 +262,7 @@ export async function cmdGithub(parsed, {
       gitPush: parsed.dryRun ? async () => ({ sha: '' }) : gitPush,
       waitForCi: parsed.dryRun
         ? async () => ({ status: CI_STATUS.PASS, summary: 'dry-run' })
-        : async ({ ref }) => waitForGithubCi({ client, owner, name, ref }),
+        : (waitForCi || (async ({ ref }) => waitForGithubCi({ client, owner, name, ref }))),
     });
     if (result.dryRun) {
       stdout('Dry run — no push, PR, comment, or label writes.');

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +8,7 @@ import { TRIGGER_LABEL } from './github-labels.mjs';
 import { parseRepoConfigText } from './github-config.mjs';
 import { createMemoryGithubClient } from './github-client.mjs';
 import { parseGithubCli, githubHelpText, cmdGithub, defaultRunImplementation } from './github-cli.mjs';
+import { emptyState, saveIssueState, loadIssueState } from './github-state.mjs';
 import { resolveTool } from './tooling.mjs';
 
 const routing = { worker: 'codex', model: 'auto' };
@@ -25,6 +26,8 @@ test('github CLI parsing', () => {
   assert.equal(run.issue, '42');
   assert.equal(parseGithubCli(['doctor', '--repo', 'o/r']).subcommand, 'doctor');
   assert.equal(parseGithubCli(['authorize', '--repo', 'o/r', '--issue', '1']).subcommand, 'authorize');
+  assert.equal(parseGithubCli(['resume', '--repo', 'o/r', '--issue', '6']).subcommand, 'resume');
+  assert.equal(parseGithubCli(['resume', '--repo', 'o/r', '--issue', '6']).issue, '6');
   assert.match(githubHelpText(), /github doctor/);
   assert.match(githubHelpText(), /never auto-merges/);
 });
@@ -195,6 +198,91 @@ test('defaultRunImplementation returns implementation branch SHA, not source HEA
     assert.equal(impl.commit, implSha);
     assert.notEqual(impl.commit, mainSha);
     assert.equal(impl.tests, 'PASS');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('github resume from LOCAL_TESTS continues push and PR without re-implementing', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-resume-'));
+  const env = { ...process.env, AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const implCommit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const implBranch = 'ai/issue-6-add-divide-operation-and-tests';
+  await mkdir(path.join(dir, '.github'), { recursive: true });
+  await writeFile(path.join(dir, '.github', 'ai-orchestrator.yml'), `automation:
+  enabled: true
+  mode: assisted
+review:
+  required: false
+`, 'utf8');
+  const client = createMemoryGithubClient({
+    issues: {
+      6: {
+        number: 6,
+        title: 'Add divide operation and tests',
+        body: 'requirements',
+        html_url: 'https://github.com/owner/app/issues/6',
+        user: { login: 'reporter' },
+        labels: [{ name: TRIGGER_LABEL }],
+      },
+    },
+    events: {
+      6: [{ event: 'labeled', label: { name: TRIGGER_LABEL }, actor: { login: 'maintainer' }, author_association: 'OWNER' }],
+    },
+    permissions: { maintainer: { permission: 'admin' } },
+    branches: ['main'],
+    repo: { default_branch: 'main', private: true },
+  });
+  let implCalls = 0;
+  let pushCalls = 0;
+  const logs = [];
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'LOCAL_TESTS',
+      localTests: 'PASS',
+      commitSha: implCommit,
+      branch: implBranch,
+      prNumber: null,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const parsed = parseGithubCli(['resume', '--repo', 'owner/app', '--issue', '6']);
+    assert.equal(parsed.subcommand, 'resume');
+    const code = await cmdGithub(parsed, {
+      cwd: dir,
+      env,
+      clientFactory: async () => client,
+      runImplementation: async () => {
+        implCalls += 1;
+        return { ok: true, tests: 'PASS', commit: 'should-not-replace', branch: 'ai/wrong' };
+      },
+      gitPush: async ({ branch }) => {
+        pushCalls += 1;
+        assert.equal(branch, implBranch);
+        return { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' };
+      },
+      waitForCi: async ({ ref }) => {
+        assert.equal(ref, implCommit);
+        return { status: 'PENDING', summary: 'GitHub checks not yet reported' };
+      },
+      stdout: s => logs.push(s),
+      stderr: s => logs.push(s),
+    });
+    assert.equal(code, 0);
+    assert.equal(implCalls, 0);
+    assert.equal(pushCalls, 1);
+    assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 1);
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.commitSha, implCommit);
+    assert.equal(saved.branch, implBranch);
+    assert.equal(saved.localTests, 'PASS');
+    assert.notEqual(saved.stage, 'LOCAL_TESTS');
+    assert.equal(saved.stage, 'WAITING_FOR_CI');
+    assert.equal(Boolean(saved.prNumber), true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

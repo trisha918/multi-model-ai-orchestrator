@@ -160,6 +160,20 @@ export function createGithubClient({
     async getPullRequest(owner, name, number) {
       return request('GET', `/repos/${owner}/${name}/pulls/${number}`);
     },
+    async getBranch(owner, name, branch) {
+      try {
+        return await request('GET', `/repos/${owner}/${name}/branches/${encodeURIComponent(branch)}`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/\b404\b/.test(msg)) return null;
+        throw e;
+      }
+    },
+    async listPulls(owner, name, { head, state: prState = 'open' } = {}) {
+      const params = new URLSearchParams({ state: prState, per_page: '30' });
+      if (head) params.set('head', head.includes(':') ? head : `${owner}:${head}`);
+      return request('GET', `/repos/${owner}/${name}/pulls?${params}`);
+    },
     async getChecks(owner, name, ref) {
       return request('GET', `/repos/${owner}/${name}/commits/${encodeURIComponent(ref)}/check-runs`);
     },
@@ -281,6 +295,21 @@ export function createMemoryGithubClient(seed = {}) {
     },
     async getPullRequest(owner, name, number) {
       return pulls.find(p => p.number === number) || null;
+    },
+    async getBranch(owner, name, branch) {
+      log.push({ op: 'getBranch', branch });
+      const map = seed.remoteBranches || {};
+      if (!Object.prototype.hasOwnProperty.call(map, branch)) return null;
+      return { name: branch, commit: { sha: map[branch] } };
+    },
+    async listPulls(owner, name, { head } = {}) {
+      log.push({ op: 'listPulls', head });
+      const want = String(head || '').includes(':') ? String(head).slice(String(head).indexOf(':') + 1) : String(head || '');
+      if (!want) return [...pulls];
+      return pulls.filter(p => {
+        const ref = typeof p.head === 'string' ? p.head : p.head?.ref;
+        return ref === want;
+      });
     },
     async getChecks(owner, name, ref) {
       const runs = checksByRef[ref] || [];

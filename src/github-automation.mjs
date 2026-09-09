@@ -69,6 +69,9 @@ export function decideTrigger({
   if (stage === 'READY_FOR_HUMAN_MERGE' || stage === 'DONE') {
     return { action: 'already-complete', reason: stage, state: existingState };
   }
+  if (stage === 'HUMAN_REVIEW_REQUIRED' && existingState?.unsafePushPending) {
+    return { action: 'resume', reason: 'unsafe-push-pending', state: existingState };
+  }
   if (stage === 'HUMAN_REVIEW_REQUIRED' || stage === 'CANCELLED' || stage === 'FAILED' || stage === 'BLOCKED' || stage === 'CONFLICT') {
     return { action: 'already-stopped', reason: stage, state: existingState };
   }
@@ -80,6 +83,73 @@ export function decideTrigger({
 
 function dryLog(plan, message, extra = {}) {
   plan.steps.push({ message, ...extra, write: false });
+}
+
+function applyImplementationResult(state, result, config) {
+  state.localTests = result?.tests || 'UNKNOWN';
+  state.review = result?.review || (config.review.required ? 'UNKNOWN' : 'SKIP');
+  if (result?.commit) state.commitSha = result.commit;
+  if (result?.route) state.route = result.route;
+  if (result?.model) state.model = result.model;
+  if (result?.branch) state.branch = result.branch;
+}
+
+function rememberPushedSha(state, pushed) {
+  if (state.commitSha) return;
+  if (pushed?.sha) state.commitSha = pushed.sha;
+}
+
+export function commitShasMatch(left, right) {
+  const a = String(left || '').trim().toLowerCase();
+  const b = String(right || '').trim().toLowerCase();
+  return Boolean(a && b && a === b);
+}
+
+function remoteCommitSha(branchInfo) {
+  return String(branchInfo?.commit?.sha || branchInfo?.sha || '').trim();
+}
+
+export async function reconcileUnsafePushPending({ client, owner, name, state }) {
+  const branch = String(state?.branch || '').trim();
+  const expected = String(state?.commitSha || '').trim();
+  if (!branch || !expected) {
+    return {
+      action: 'human',
+      reason: 'Crash recovery: a push may have been interrupted, but branch or commit SHA is missing. Human confirmation required before pushing again.',
+    };
+  }
+  if (typeof client.getBranch !== 'function') {
+    return {
+      action: 'human',
+      reason: 'Crash recovery: cannot inspect the remote branch. Human confirmation required before pushing again.',
+    };
+  }
+  let remote = null;
+  try {
+    remote = await client.getBranch(owner, name, branch);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!/\b404\b/.test(msg)) {
+      return {
+        action: 'human',
+        reason: `Crash recovery: failed to inspect remote branch ${branch}. Human confirmation required before pushing again.`,
+      };
+    }
+  }
+  const remoteSha = remoteCommitSha(remote);
+  if (!remoteSha) {
+    return {
+      action: 'human',
+      reason: `Crash recovery: remote branch ${branch} was not found. Human confirmation required before pushing again.`,
+    };
+  }
+  if (!commitShasMatch(remoteSha, expected)) {
+    return {
+      action: 'human',
+      reason: `Crash recovery: remote ${branch} is ${remoteSha} but expected ${expected}. Refusing to force-push.`,
+    };
+  }
+  return { action: 'reconciled', branch, sha: remoteSha };
 }
 
 export async function simulateGithubAutomation(fixture = {}) {
@@ -278,12 +348,30 @@ export async function runIssueAutomation({
 
   try {
     let state = inspected.state || emptyState({ repo: slug, issue });
+    let skipGitPush = false;
     if (decision.action === 'resume' && state.unsafePushPending) {
-      state.stage = 'HUMAN_REVIEW_REQUIRED';
-      state.lastDiagnosis = 'Crash recovery: a push may have been interrupted. Human confirmation required before pushing again.';
+      const rec = await reconcileUnsafePushPending({ client, owner, name, state });
+      if (rec.action !== 'reconciled') {
+        state.stage = 'HUMAN_REVIEW_REQUIRED';
+        state.lastDiagnosis = rec.reason;
+        if (!dryRun) state = await saveIssueState(state, env);
+        await applyLabels(client, { owner, name, issueNumber, issue, stage: 'HUMAN_REVIEW_REQUIRED', dryRun, plan });
+        return { code: 2, needsConfirmation: true, plan, state, decision };
+      }
+      state.unsafePushPending = false;
+      state.lastFailure = '';
+      state.lastDiagnosis = '';
+      skipGitPush = true;
       if (!dryRun) state = await saveIssueState(state, env);
-      return { code: 2, needsConfirmation: true, plan, state };
     }
+
+    const resumeLocalTests = skipGitPush || (
+      decision.action === 'resume'
+      && state.stage === 'LOCAL_TESTS'
+      && (state.localTests === 'PASS' || state.localTests === 'SKIP')
+      && !state.prNumber
+      && Boolean(state.branch && state.commitSha)
+    );
 
     state.mode = config.automation.mode;
     state.maxAttempts = config.automation.max_fix_attempts;
@@ -291,7 +379,7 @@ export async function runIssueAutomation({
     state.model = routing.selection === 'MANUAL' ? routing.model : 'AUTO';
     state.selectedRoute = routing.worker;
     state.selectedModels = state.model;
-    state.stage = 'STARTED';
+    if (!resumeLocalTests) state.stage = 'STARTED';
 
     const taskCtx = buildIssueTaskContext({ issue, repository: slug, routing });
 
@@ -304,24 +392,26 @@ export async function runIssueAutomation({
       return { code: 0, dryRun: true, plan, state, decision, task: taskCtx.task };
     }
 
-    await applyLabels(client, { owner, name, issueNumber, issue, stage: 'WORKING', dryRun, plan });
-    state.stage = 'WORKING';
-    state = await upsertStatus(client, {
-      owner,
-      name,
-      issueNumber,
-      state,
-      dryRun,
-      plan,
-      body: formatStatusComment({
-        headline: MILESTONE_HEADLINES.STARTED,
-        route: state.route,
-        model: state.model,
-        attempt: Math.max(1, state.ciAttempts || 1),
-        maxAttempts: state.maxAttempts,
-      }),
-    });
-    state = await saveIssueState(state, env);
+    if (!resumeLocalTests) {
+      await applyLabels(client, { owner, name, issueNumber, issue, stage: 'WORKING', dryRun, plan });
+      state.stage = 'WORKING';
+      state = await upsertStatus(client, {
+        owner,
+        name,
+        issueNumber,
+        state,
+        dryRun,
+        plan,
+        body: formatStatusComment({
+          headline: MILESTONE_HEADLINES.STARTED,
+          route: state.route,
+          model: state.model,
+          attempt: Math.max(1, state.ciAttempts || 1),
+          maxAttempts: state.maxAttempts,
+        }),
+      });
+      state = await saveIssueState(state, env);
+    }
 
     const existingPrs = await client.listPullsForIssue(owner, name, issueNumber);
     if (existingPrs.length && !state.prNumber) {
@@ -352,19 +442,77 @@ export async function runIssueAutomation({
         state,
         env,
       });
-      state.localTests = result.tests || 'UNKNOWN';
-      state.review = result.review || (config.review.required ? 'UNKNOWN' : 'SKIP');
-      state.commitSha = result.commit || state.commitSha;
-      state.route = result.route || state.route;
-      state.model = result.model || state.model;
-      state.branch = result.branch || state.branch;
-      if (result.ok === false || (config.tests.required && result.tests === 'FAIL')) {
-        return { failed: true, result };
-      }
-      return { failed: false, result };
+      applyImplementationResult(state, result, config);
+      const failed = result.ok === false || (config.tests.required && result.tests === 'FAIL');
+      if (!failed) state.stage = 'LOCAL_TESTS';
+      state = await saveIssueState(state, env);
+      return { failed, result };
     }
 
-    if (!state.prNumber) {
+    async function findExistingPullRequest() {
+      const forIssue = await client.listPullsForIssue(owner, name, issueNumber);
+      if (forIssue.length) return forIssue[0];
+      if (typeof client.listPulls === 'function' && state.branch) {
+        const listed = await client.listPulls(owner, name, { head: `${owner}:${state.branch}`, state: 'open' });
+        if (listed?.length) return listed[0];
+      }
+      return null;
+    }
+
+    async function pushBranchAndOpenPr({ skipGitPush: skipPush = false } = {}) {
+      assertSafePushBranch(state.branch);
+      const existing = await findExistingPullRequest();
+      if (existing?.number) {
+        state.prNumber = existing.number;
+        state.unsafePushPending = false;
+        state = await saveIssueState(state, env);
+        return { crashed: false };
+      }
+      if (!skipPush && typeof gitPush === 'function') {
+        state.unsafePushPending = true;
+        state = await saveIssueState(state, env);
+        try {
+          const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
+          rememberPushedSha(state, pushed);
+          state.unsafePushPending = false;
+          state = await saveIssueState(state, env);
+        } catch (e) {
+          state.lastFailure = e instanceof Error ? e.message : String(e);
+          state = await saveIssueState(state, env);
+          return { crashed: true };
+        }
+      }
+      if (config.pull_request.create && !state.prNumber) {
+        try {
+          const pr = await client.createPullRequest(owner, name, {
+            title: prTitleForIssue(issue),
+            body: prBodyForIssue({
+              issue,
+              repository: slug,
+              route: state.route,
+              models: state.model,
+              localTests: state.localTests,
+              githubCi: 'PENDING',
+              attempt: 1,
+              maxAttempts: state.maxAttempts,
+              branch: state.branch,
+              review: state.review,
+            }),
+            head: state.branch,
+            base: defaultBranch,
+          });
+          state.prNumber = pr.number;
+          state = await saveIssueState(state, env);
+        } catch (e) {
+          state.lastFailure = e instanceof Error ? e.message : String(e);
+          state = await saveIssueState(state, env);
+          return { crashed: true };
+        }
+      }
+      return { crashed: false };
+    }
+
+    if (!state.prNumber && !resumeLocalTests) {
       const first = await implementRound();
       if (first.stopped) {
         state = await saveIssueState(state, env);
@@ -378,40 +526,12 @@ export async function runIssueAutomation({
         await applyLabels(client, { owner, name, issueNumber, issue, stage: 'FAILED', dryRun, plan });
         return { code: 1, plan, state };
       }
-      assertSafePushBranch(state.branch);
-      if (typeof gitPush === 'function') {
-        state.unsafePushPending = true;
-        state = await saveIssueState(state, env);
-        try {
-          const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
-          state.commitSha = pushed?.sha || state.commitSha;
-          state.unsafePushPending = false;
-          state = await saveIssueState(state, env);
-        } catch (e) {
-          state.lastFailure = e instanceof Error ? e.message : String(e);
-          state = await saveIssueState(state, env);
-          return { code: 1, crashed: true, plan, state };
-        }
-      }
-      if (config.pull_request.create && !state.prNumber) {
-        const pr = await client.createPullRequest(owner, name, {
-          title: prTitleForIssue(issue),
-          body: prBodyForIssue({
-            issue,
-            repository: slug,
-            route: state.route,
-            models: state.model,
-            localTests: state.localTests,
-            githubCi: 'PENDING',
-            attempt: 1,
-            maxAttempts: state.maxAttempts,
-            branch: state.branch,
-            review: state.review,
-          }),
-          head: state.branch,
-          base: defaultBranch,
-        });
-        state.prNumber = pr.number;
+    }
+
+    if (!state.prNumber && (state.localTests === 'PASS' || state.localTests === 'SKIP')) {
+      const pushed = await pushBranchAndOpenPr({ skipGitPush });
+      if (pushed.crashed) {
+        return { code: 1, crashed: true, plan, state };
       }
     }
 
@@ -470,7 +590,7 @@ export async function runIssueAutomation({
           state = await saveIssueState(state, env);
           try {
             const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
-            state.commitSha = pushed?.sha || state.commitSha;
+            rememberPushedSha(state, pushed);
             state.unsafePushPending = false;
           } catch (e) {
             state.lastFailure = e instanceof Error ? e.message : String(e);

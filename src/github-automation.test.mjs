@@ -6,7 +6,7 @@ import path from 'node:path';
 import { parseRepoConfigText } from './github-config.mjs';
 import { createMemoryGithubClient } from './github-client.mjs';
 import { decideTrigger, recordCiResult, runIssueAutomation, simulateGithubAutomation, CI_STATUS } from './github-automation.mjs';
-import { acquireIssueLock, loadIssueState } from './github-state.mjs';
+import { acquireIssueLock, loadIssueState, saveIssueState, emptyState } from './github-state.mjs';
 import { TRIGGER_LABEL, STOP_LABEL } from './github-labels.mjs';
 import { authorizeAiAutoTrigger } from './github-auth.mjs';
 
@@ -85,6 +85,22 @@ test('trusted ai-auto starts automation', () => {
   });
   const decision = decideTrigger({ config: assisted, labels: [TRIGGER_LABEL], authorization });
   assert.equal(decision.action, 'start');
+});
+
+test('HUMAN_REVIEW_REQUIRED with unsafePushPending is resumable', () => {
+  const authorization = { ok: true };
+  assert.equal(decideTrigger({
+    config: assisted,
+    labels: [TRIGGER_LABEL],
+    authorization,
+    existingState: { stage: 'HUMAN_REVIEW_REQUIRED', unsafePushPending: true },
+  }).action, 'resume');
+  assert.equal(decideTrigger({
+    config: assisted,
+    labels: [TRIGGER_LABEL],
+    authorization,
+    existingState: { stage: 'HUMAN_REVIEW_REQUIRED', unsafePushPending: false },
+  }).action, 'already-stopped');
 });
 
 test('deterministic 3-attempt PASS fixture ends READY_FOR_HUMAN_MERGE at 3/5', async () => {
@@ -327,9 +343,12 @@ test('crash with unsafePushPending requires human confirmation on resume', async
       issueNumber: 42,
       env,
       runImplementation: async () => ({ ok: true, tests: 'PASS', review: 'PASS', commit: 'abc', branch: 'ai/x' }),
-      gitPush: async () => ({ sha: 'abc' }),
+      gitPush: async () => {
+        throw new Error('must not retry push without remote proof');
+      },
     });
     assert.equal(second.needsConfirmation || second.state?.stage === 'HUMAN_REVIEW_REQUIRED' || second.skipped, true);
+    assert.equal(second.state?.unsafePushPending, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -382,6 +401,437 @@ test('genuine local test FAIL still marks automation FAILED', async () => {
     assert.equal(result.state.localTests, 'FAIL');
     assert.equal(result.state.lastFailure, 'local tests failed');
     assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('successful runImplementation commit and branch are persisted and PR continues', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const implCommit = '79ebe894fde20fb9e77c15a0b1e1108ae739a7d8';
+  const implBranch = 'ai/issue-5-test';
+  const sourceHead = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const client = createMemoryGithubClient({
+    issues: {
+      5: {
+        number: 5,
+        title: 'test',
+        body: 'requirements',
+        html_url: 'https://github.com/owner/app/issues/5',
+        user: { login: 'reporter' },
+        labels: [{ name: TRIGGER_LABEL }],
+      },
+    },
+    events: {
+      5: [{ event: 'labeled', label: { name: TRIGGER_LABEL }, actor: { login: 'maintainer' }, author_association: 'OWNER' }],
+    },
+    permissions: { maintainer: { permission: 'admin' } },
+    branches: ['main'],
+    repo: { default_branch: 'main', private: true },
+  });
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 5,
+      env,
+      runImplementation: async () => ({
+        ok: true,
+        tests: 'PASS',
+        commit: implCommit,
+        branch: implBranch,
+      }),
+      gitPush: async ({ branch }) => {
+        assert.equal(branch, implBranch);
+        return { sha: sourceHead };
+      },
+      waitForCi: async ({ ref }) => {
+        assert.equal(ref, implCommit);
+        return { status: CI_STATUS.PASS, summary: 'ok' };
+      },
+    });
+    assert.equal(result.state.commitSha, implCommit);
+    assert.equal(result.state.branch, implBranch);
+    assert.notEqual(result.state.stage, 'IMPLEMENTING');
+    assert.equal(result.state.stage, 'READY_FOR_HUMAN_MERGE');
+    assert.equal(result.state.localTests, 'PASS');
+    assert.equal(Boolean(result.state.prNumber), true);
+    const saved = await loadIssueState('owner/app', 5, env);
+    assert.equal(saved.commitSha, implCommit);
+    assert.equal(saved.branch, implBranch);
+    assert.notEqual(saved.stage, 'IMPLEMENTING');
+    assert.notEqual(saved.stage, 'LOCAL_TESTS');
+    assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('successful implementation continues through push and PR creation', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const order = [];
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch }) => {
+        order.push('implement');
+        return {
+          ok: true,
+          tests: 'PASS',
+          commit: '2d1d7a07bb537b06f07f1afa8aea2b580064a09f',
+          branch,
+        };
+      },
+      gitPush: async ({ branch }) => {
+        order.push('push');
+        assert.match(branch, /^ai\/issue-42-/);
+        return { sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' };
+      },
+      waitForCi: async () => {
+        order.push('ci');
+        return { status: CI_STATUS.PASS, summary: 'ok' };
+      },
+    });
+    assert.deepEqual(order, ['implement', 'push', 'ci']);
+    assert.equal(result.state.commitSha, '2d1d7a07bb537b06f07f1afa8aea2b580064a09f');
+    assert.notEqual(result.state.stage, 'LOCAL_TESTS');
+    assert.equal(result.state.stage, 'READY_FOR_HUMAN_MERGE');
+    assert.equal(Boolean(result.state.prNumber), true);
+    assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('resume from LOCAL_TESTS pushes and opens PR without re-implementing', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const implCommit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const implBranch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient({
+    issues: {
+      6: {
+        number: 6,
+        title: 'Add divide operation and tests',
+        body: 'requirements',
+        html_url: 'https://github.com/owner/app/issues/6',
+        user: { login: 'reporter' },
+        labels: [{ name: TRIGGER_LABEL }],
+      },
+    },
+    events: {
+      6: [{ event: 'labeled', label: { name: TRIGGER_LABEL }, actor: { login: 'maintainer' }, author_association: 'OWNER' }],
+    },
+    permissions: { maintainer: { permission: 'admin' } },
+    branches: ['main'],
+    repo: { default_branch: 'main', private: true },
+  });
+  let implCalls = 0;
+  let pushCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'LOCAL_TESTS',
+      localTests: 'PASS',
+      commitSha: implCommit,
+      branch: implBranch,
+      prNumber: null,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        return { ok: true, tests: 'PASS', commit: 'should-not-replace', branch: 'ai/wrong' };
+      },
+      gitPush: async ({ branch }) => {
+        pushCalls += 1;
+        assert.equal(branch, implBranch);
+        return { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' };
+      },
+      waitForCi: async ({ ref }) => {
+        assert.equal(ref, implCommit);
+        return { status: CI_STATUS.PASS, summary: 'ok' };
+      },
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(pushCalls, 1);
+    assert.equal(result.state.commitSha, implCommit);
+    assert.equal(result.state.branch, implBranch);
+    assert.notEqual(result.state.stage, 'LOCAL_TESTS');
+    assert.equal(result.state.stage, 'READY_FOR_HUMAN_MERGE');
+    assert.equal(Boolean(result.state.prNumber), true);
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.prNumber, result.state.prNumber);
+    assert.equal(saved.stage, 'READY_FOR_HUMAN_MERGE');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+function seedIssueNumber(number, extra = {}) {
+  return {
+    issues: {
+      [number]: {
+        number,
+        title: extra.title || 'Add divide operation and tests',
+        body: extra.body || 'requirements',
+        html_url: `https://github.com/owner/app/issues/${number}`,
+        user: { login: 'reporter' },
+        labels: [{ name: TRIGGER_LABEL }],
+      },
+    },
+    events: {
+      [number]: [{ event: 'labeled', label: { name: TRIGGER_LABEL }, actor: { login: 'maintainer' }, author_association: 'OWNER' }],
+    },
+    permissions: { maintainer: { permission: 'admin' } },
+    branches: ['main'],
+    repo: { default_branch: 'main', private: true },
+    ...extra.seed,
+  };
+}
+
+test('unsafePushPending with matching remote SHA continues without pushing', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const implCommit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const implBranch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: { remoteBranches: { [implBranch]: implCommit } },
+  }));
+  let pushCalls = 0;
+  let implCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'HUMAN_REVIEW_REQUIRED',
+      unsafePushPending: true,
+      localTests: 'PASS',
+      commitSha: implCommit,
+      branch: implBranch,
+      prNumber: null,
+      mode: 'assisted',
+      maxAttempts: 5,
+      lastFailure: 'src refspec ai/issue-6-add-divide-operation-and-tests does not match any',
+      lastDiagnosis: 'Crash recovery: a push may have been interrupted. Human confirmation required before pushing again.',
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        return { ok: true, tests: 'PASS', commit: implCommit, branch: implBranch };
+      },
+      gitPush: async ({ force }) => {
+        pushCalls += 1;
+        assert.equal(force, false);
+        throw new Error('must not push after remote SHA match');
+      },
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'checks not yet reported' }),
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(pushCalls, 0);
+    assert.equal(result.state.unsafePushPending, false);
+    assert.equal(result.state.lastFailure, '');
+    assert.equal(result.state.lastDiagnosis, '');
+    assert.notEqual(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(result.state.stage, 'WAITING_FOR_CI');
+    assert.equal(Boolean(result.state.prNumber), true);
+    assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 1);
+    assert.equal(client.log.filter(x => x.op === 'getBranch').length > 0, true);
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.unsafePushPending, false);
+    assert.equal(saved.lastFailure, '');
+    assert.equal(saved.lastDiagnosis, '');
+    assert.equal(saved.stage, 'WAITING_FOR_CI');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('unsafePushPending with missing remote branch stays HUMAN_REVIEW_REQUIRED', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const implCommit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const implBranch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6));
+  let pushCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'HUMAN_REVIEW_REQUIRED',
+      unsafePushPending: true,
+      localTests: 'PASS',
+      commitSha: implCommit,
+      branch: implBranch,
+      prNumber: null,
+      mode: 'assisted',
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      gitPush: async () => {
+        pushCalls += 1;
+        throw new Error('must not retry push');
+      },
+    });
+    assert.equal(pushCalls, 0);
+    assert.equal(result.needsConfirmation, true);
+    assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(result.state.unsafePushPending, true);
+    assert.equal(result.state.prNumber, null);
+    assert.match(result.state.lastDiagnosis, /not found/i);
+    assert.doesNotMatch(result.state.lastDiagnosis || '', /force-push/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('unsafePushPending with remote SHA mismatch stays HUMAN_REVIEW_REQUIRED', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const implCommit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const other = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const implBranch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: { remoteBranches: { [implBranch]: other } },
+  }));
+  let pushCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'HUMAN_REVIEW_REQUIRED',
+      unsafePushPending: true,
+      localTests: 'PASS',
+      commitSha: implCommit,
+      branch: implBranch,
+      prNumber: null,
+      mode: 'assisted',
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      gitPush: async ({ force }) => {
+        pushCalls += 1;
+        assert.equal(force, false);
+        throw new Error('must not force-push on mismatch');
+      },
+    });
+    assert.equal(pushCalls, 0);
+    assert.equal(result.needsConfirmation, true);
+    assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(result.state.unsafePushPending, true);
+    assert.match(result.state.lastDiagnosis, /expected/);
+    assert.match(result.state.lastDiagnosis, /force-push/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('unsafePushPending matching remote reuses existing PR and does not duplicate', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const implCommit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const implBranch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: {
+      remoteBranches: { [implBranch]: implCommit },
+      pulls: [{ number: 77, head: { ref: implBranch, sha: implCommit }, body: 'Closes #6', issueNumber: 6 }],
+    },
+  }));
+  let pushCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'HUMAN_REVIEW_REQUIRED',
+      unsafePushPending: true,
+      localTests: 'PASS',
+      commitSha: implCommit,
+      branch: implBranch,
+      prNumber: null,
+      mode: 'assisted',
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      gitPush: async ({ force }) => {
+        pushCalls += 1;
+        assert.equal(force, false);
+        throw new Error('must not push when PR already exists');
+      },
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'pending' }),
+    });
+    assert.equal(pushCalls, 0);
+    assert.equal(result.state.prNumber, 77);
+    assert.equal(result.state.unsafePushPending, false);
+    assert.equal(result.state.stage, 'WAITING_FOR_CI');
+    assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('assisted run never requests a force push', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const forces = [];
+  try {
+    await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch }) => ({ ok: true, tests: 'PASS', commit: 'abc', branch }),
+      gitPush: async ({ force }) => {
+        forces.push(force);
+        return { sha: 'abc' };
+      },
+      waitForCi: async () => ({ status: CI_STATUS.PASS, summary: 'ok' }),
+    });
+    assert.equal(forces.length > 0, true);
+    assert.equal(forces.every(f => f === false), true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
