@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, mkdir, readdir } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -166,6 +166,27 @@ test('defaultRunImplementation reports FAIL for genuine local-test failures', as
   assert.equal(impl.ok, false);
   assert.equal(impl.tests, 'FAIL');
   assert.equal(impl.commit, 'impl-sha');
+});
+
+test('defaultRunImplementation deletes the temp task directory even when runTask throws', async () => {
+  const listed = async () => (await readdir(os.tmpdir())).filter(name => name.startsWith('ai-orch-gh-task-'));
+  const before = new Set(await listed());
+  await assert.rejects(
+    () => defaultRunImplementation({
+      repo: os.tmpdir(),
+      branch: 'ai/issue-1-demo',
+      task: 'implement',
+      routing,
+      env: {},
+      runTaskImpl: async () => {
+        throw new Error('implementation process terminated');
+      },
+      gitImpl: async () => 'unused',
+    }),
+    /process terminated/,
+  );
+  const leftover = (await listed()).filter(name => !before.has(name));
+  assert.deepEqual(leftover, []);
 });
 
 test('defaultRunImplementation returns implementation branch SHA, not source HEAD', async () => {

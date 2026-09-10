@@ -15,6 +15,7 @@ import { git } from './workspace.mjs';
 import { collectGithubDoctor, formatGithubDoctor, collectIssueDoctor, formatIssueDoctor } from './github-doctor.mjs';
 import { formatGithubRepoDoctor, probeGithubRepo } from './github-probe.mjs';
 import { detectGithubAuth } from './github-client.mjs';
+import { cleanupOwnedTempDir } from './worker-isolation.mjs';
 
 export function parseGithubCli(argv) {
   const args = [...argv];
@@ -97,26 +98,30 @@ export async function defaultRunImplementation({
   gitImpl = git,
 } = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-task-'));
-  const taskFile = path.join(dir, 'task.txt');
-  await writeFile(taskFile, task, { encoding: 'utf8' });
-  const argv = implementationArgv({ repo, branch, taskFile, routing });
-  const code = await runTaskImpl(argv, { env });
-  const numeric = code === 0 ? 0 : (Number.isInteger(code) ? code : 1);
-  let hash = '';
   try {
-    hash = await gitImpl(repo, ['rev-parse', branch]);
-  } catch {
-    hash = '';
+    const taskFile = path.join(dir, 'task.txt');
+    await writeFile(taskFile, task, { encoding: 'utf8' });
+    const argv = implementationArgv({ repo, branch, taskFile, routing });
+    const code = await runTaskImpl(argv, { env });
+    const numeric = code === 0 ? 0 : (Number.isInteger(code) ? code : 1);
+    let hash = '';
+    try {
+      hash = await gitImpl(repo, ['rev-parse', branch]);
+    } catch {
+      hash = '';
+    }
+    return {
+      ok: numeric === 0,
+      tests: numeric === 0 ? 'PASS' : 'FAIL',
+      review: 'PASS',
+      commit: hash,
+      branch,
+      route: routing.worker,
+      model: routing.model,
+    };
+  } finally {
+    await cleanupOwnedTempDir(dir);
   }
-  return {
-    ok: numeric === 0,
-    tests: numeric === 0 ? 'PASS' : 'FAIL',
-    review: 'PASS',
-    commit: hash,
-    branch,
-    route: routing.worker,
-    model: routing.model,
-  };
 }
 
 export async function defaultGitPush({ branch, repo }) {

@@ -36,6 +36,12 @@ import {
   verifyRunWorkspace,
   workspaceTraceRecord,
 } from './workspace-context.mjs';
+import {
+  assertBoundToRunWorkspace,
+  assertNotForeignWorktree,
+  recordHeadSha,
+  writeRunCheckpoint,
+} from './worker-isolation.mjs';
 
 let config = loadConfig();
 
@@ -292,10 +298,11 @@ async function cursorAgent(repo, prompt, model = 'auto', readOnly = false, runCo
 async function codex(repo, prompt, windowsUnelevated, model = '', exec = executeProcess) {
   console.log('\n--- CODEX ---\n');
   if (model) console.log(`Model: ${model}\n`);
+  const cwd = requireExplicitCwd(repo, 'codex');
   const launch = buildCodexCliArgs({
     windowsUnelevated,
     model,
-    cwd: repo,
+    cwd,
     isWin,
   });
   console.log(`Codex cwd: ${launch.cwd}\n`);
@@ -500,6 +507,26 @@ function addStage(name, status, durationMs, extra = {}) {
   stages.push({ name, status, durationMs: durationMs || 0, ...extra });
 }
 
+async function persistCheckpoint(extra = {}) {
+  let headSha = extra.headSha || meta.headSha || '';
+  if (!headSha && repo) {
+    headSha = await recordHeadSha(repo);
+  }
+  if (headSha) meta.headSha = headSha;
+  const checkpoint = await writeRunCheckpoint(runDir, {
+    runId: isolatedMeta.runId,
+    worktree: worktree || repo,
+    branch: taskBranch,
+    headSha: meta.headSha || '',
+    lastStage: stages.at(-1)?.name || '',
+    stages,
+  });
+  const nextMeta = { ...meta };
+  if (extra.error) nextMeta.error = extra.error;
+  await writeFile(path.join(runDir, 'meta.json'), JSON.stringify(nextMeta, null, 2), 'utf8');
+  return checkpoint;
+}
+
 async function pinWorkspace(stage) {
   const identity = await verifyRunWorkspace({
     workspace: repo,
@@ -511,9 +538,15 @@ async function pinWorkspace(stage) {
     worktreesRoot: dirs.worktrees,
     stage,
   });
+  assertBoundToRunWorkspace(identity.cwd, repo, stage);
+  assertNotForeignWorktree(identity.cwd, {
+    runId: isolatedMeta.runId,
+    worktreesRoot: dirs.worktrees,
+  });
   const rec = workspaceTraceRecord({ ...identity, sourceRoot: sourceInfo.root });
   workspaceTrace.push(rec);
   await writeFile(path.join(runDir, 'workspace-trace.json'), JSON.stringify(workspaceTrace, null, 2), 'utf8');
+  await persistCheckpoint();
   return identity;
 }
 
@@ -528,6 +561,8 @@ try {
     result.branch = taskBranch;
     meta.worktree = worktree;
     meta.taskBranch = taskBranch;
+    meta.headSha = await recordHeadSha(repo);
+    await persistCheckpoint();
   } else {
     console.log('\nWARNING: --in-place disables Git isolation. Agents will operate directly in the source repository.\n');
     meta.worktree = sourceInfo.root;
@@ -740,7 +775,7 @@ try {
     console.error(formatDirtyFiles(endSource.status));
   }
 
-  let commitResult = { committed: false, reason: 'commit not requested', hash: '' };
+  let commitResult = { committed: false, reason: 'commit not requested', hash: await recordHeadSha(repo) };
   const testsOk = tests.status === 'PASS' || tests.status === 'SKIP';
   const implOk = result.implementation === 'PASS' || route.route === 'GEMINI';
   const reviewOk = route.route !== 'TEAM' || result.review === 'PASS';
@@ -756,11 +791,17 @@ try {
     commitResult = await commitChanges(repo, args.task);
     console.log(commitResult.committed ? `Committed locally: ${commitResult.hash}` : `No commit created: ${commitResult.reason}`);
   } else if (args.commitOnPass) {
-    commitResult = { committed: false, reason: result.failedStage || `tests=${tests.status} review=${result.review}`, hash: '' };
+    commitResult = { committed: false, reason: result.failedStage || `tests=${tests.status} review=${result.review}`, hash: await recordHeadSha(repo) };
     console.log(`\nCommit skipped (${commitResult.reason}).`);
   }
 
   const success = result.ok && testsOk && (route.route !== 'TEAM' || result.review === 'PASS');
+  meta.commitCreated = commitResult.committed;
+  meta.commitHash = commitResult.hash;
+  meta.commitReason = commitResult.reason;
+  meta.headSha = commitResult.hash || meta.headSha || await recordHeadSha(repo);
+  await persistCheckpoint();
+
   let worktreeState = worktree ? 'PRESERVED FOR DEBUGGING' : (args.inPlace ? 'IN-PLACE' : '(none)');
   if (worktree && isolatedMeta.createdByOrchestrator) {
     const keep = success ? config.keepSuccessWorktrees : config.keepFailedWorktrees;
@@ -776,12 +817,9 @@ try {
     }
   }
   result.worktreeState = worktreeState;
+  meta.worktreeState = worktreeState;
 
   timings.totalMs = Date.now() - startedAt;
-  meta.commitCreated = commitResult.committed;
-  meta.commitHash = commitResult.hash;
-  meta.commitReason = commitResult.reason;
-  meta.worktreeState = worktreeState;
   await writeFile(path.join(runDir, 'meta.json'), JSON.stringify(meta, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'timings.json'), JSON.stringify(timings, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'workspace-trace.json'), JSON.stringify(workspaceTrace, null, 2), 'utf8');
@@ -808,7 +846,20 @@ try {
   result.ok = false;
   result.worktreeState = worktree ? 'PRESERVED FOR DEBUGGING' : result.worktreeState;
   timings.totalMs = Date.now() - startedAt;
-  await writeFile(path.join(runDir, 'meta.json'), JSON.stringify({ ...meta, error: msg }, null, 2), 'utf8');
+  try {
+    const endSource = await inspectSourceRepo(sourceInfo.root);
+    if (!args.inPlace && sourceFingerprint(endSource) !== startFingerprint) {
+      result.mainModified = true;
+      if (!result.failedStage) result.failedStage = 'SAFETY FAILURE';
+    }
+  } catch {
+    // source inspect is best-effort on the failure path
+  }
+  const headSha = repo ? await recordHeadSha(repo) : '';
+  meta.commitHash = headSha;
+  meta.headSha = headSha;
+  result.commit = headSha || result.commit;
+  await persistCheckpoint({ error: msg });
   await writeFile(path.join(runDir, 'timings.json'), JSON.stringify(timings, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'stages.json'), JSON.stringify(stages, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'workspace-trace.json'), JSON.stringify(workspaceTrace, null, 2), 'utf8');

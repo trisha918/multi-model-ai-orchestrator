@@ -201,16 +201,22 @@ export async function createIsolatedWorktree(sourceRepo, task, requestedBranch, 
 }
 
 export async function commitChanges(repo, task) {
+  let hash = '';
+  try {
+    hash = await git(repo, ['rev-parse', 'HEAD']);
+  } catch {
+    hash = '';
+  }
   const state = await gitState(repo);
   if (!state.status.trim()) {
-    return { committed: false, reason: 'no changes to commit', hash: '' };
+    return { committed: false, reason: 'no changes to commit', hash };
   }
 
   await git(repo, ['add', '-A'], { quiet: false });
   const summary = task.replace(/\s+/g, ' ').trim().slice(0, 72) || 'automated task';
   const message = `ai: ${summary}`;
   await git(repo, ['commit', '-m', message], { quiet: false });
-  const hash = await git(repo, ['rev-parse', 'HEAD']);
+  hash = await git(repo, ['rev-parse', 'HEAD']);
   return { committed: true, reason: '', hash };
 }
 
