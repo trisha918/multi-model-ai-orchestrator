@@ -20,6 +20,7 @@ import {
   STOPPED_STAGES,
 } from './github-state.mjs';
 import { runtimeDirs } from './paths.mjs';
+import { createGithubEventLog, issueEventsPath } from './github-events.mjs';
 
 export { CI_STATUS };
 export { isAllowedTransition, transitionStage, applyStage, ALLOWED_TRANSITIONS } from './github-state.mjs';
@@ -365,37 +366,59 @@ export async function runIssueAutomation({
   gitPush,
   defaultBranch = 'main',
   ciTimeoutMs = 60 * 60 * 1000,
+  eventLog,
 } = {}) {
   const plan = { steps: [], writes: [] };
   const { owner, name, slug } = parseRepoSlug(repo);
+  const events = eventLog || createGithubEventLog({
+    persistPath: dryRun ? '' : issueEventsPath(slug, issueNumber, env),
+  });
   const inspected = await inspectIssueAutomation({ client, config, repo: slug, issueNumber, env });
   const { issue, authorization, decision, routingError } = inspected;
   let routing = inspected.routing;
+  const emit = (action, result, stage) => events.emit({
+    repository: slug,
+    issue: issueNumber,
+    stage: stage || inspected.state?.stage || 'IDLE',
+    action,
+    result,
+  });
+  const done = (result) => ({ ...result, events: events.records });
+
+  await emit('issue_received', decision.action, inspected.state?.stage || 'IDLE');
+  if (decision.action !== 'block') {
+    await emit(
+      'authorization_checked',
+      authorization?.ok ? 'allowed' : (decision.action || 'skip'),
+      inspected.state?.stage || 'IDLE',
+    );
+  }
 
   if (decision.action === 'skip') {
-    return { code: 0, skipped: true, decision, plan, state: inspected.state };
+    return done({ code: 0, skipped: true, decision, plan, state: inspected.state });
   }
   if (decision.action === 'cancel') {
-    return { code: 0, cancelled: true, decision, plan, state: inspected.state };
+    return done({ code: 0, cancelled: true, decision, plan, state: inspected.state });
   }
   if (decision.action === 'busy') {
-    return { code: 2, skipped: true, decision, plan, state: inspected.state };
+    return done({ code: 2, skipped: true, decision, plan, state: inspected.state });
   }
   if (decision.action === 'already-complete' || decision.action === 'already-stopped') {
-    return { code: 0, skipped: true, resumed: false, decision, plan, state: inspected.state };
+    return done({ code: 0, skipped: true, resumed: false, decision, plan, state: inspected.state });
   }
   if (decision.action === 'block') {
     let state = inspected.state || emptyState({ repo: slug, issue });
     applyStage(state, 'BLOCKED');
     state.lastFailure = BLOCK_UNTRUSTED;
     if (!dryRun) state = await saveIssueState(state, env);
+    await emit('authorization_checked', 'blocked', 'BLOCKED');
     const body = formatStatusComment({
       headline: MILESTONE_HEADLINES.BLOCKED,
       diagnosis: `AUTOMATION BLOCKED\nReason: ${BLOCK_UNTRUSTED}`,
     });
     await upsertStatus(client, { owner, name, issueNumber, state, body, dryRun, plan });
     await applyLabels(client, { owner, name, issueNumber, issue, stage: 'BLOCKED', dryRun, plan, keepTrigger: true });
-    return { code: 2, blocked: true, decision, plan, state };
+    return done({ code: 2, blocked: true, decision, plan, state });
   }
 
   if (routingError) {
@@ -409,12 +432,12 @@ export async function runIssueAutomation({
     });
     await upsertStatus(client, { owner, name, issueNumber, state, body, dryRun, plan });
     await applyLabels(client, { owner, name, issueNumber, issue, stage: 'CONFLICT', dryRun, plan });
-    return { code: 2, conflict: true, decision, plan, state };
+    return done({ code: 2, conflict: true, decision, plan, state });
   }
 
   const lock = dryRun ? { ok: true } : await acquireIssueLock(slug, issueNumber, env);
   if (!lock.ok) {
-    return { code: 2, skipped: true, decision: { action: 'busy', reason: lock.reason }, plan, state: inspected.state };
+    return done({ code: 2, skipped: true, decision: { action: 'busy', reason: lock.reason }, plan, state: inspected.state });
   }
 
   try {
@@ -435,7 +458,7 @@ export async function runIssueAutomation({
         state.lastDiagnosis = rec.reason;
         if (!dryRun) state = await saveIssueState(state, env);
         await applyLabels(client, { owner, name, issueNumber, issue, stage: 'HUMAN_REVIEW_REQUIRED', dryRun, plan });
-        return { code: 2, needsConfirmation: true, plan, state, decision };
+        return done({ code: 2, needsConfirmation: true, plan, state, decision });
       }
       state.unsafePushPending = false;
       state.lastFailure = '';
@@ -478,7 +501,7 @@ export async function runIssueAutomation({
       if (config.pull_request.create) dryLog(plan, 'Would create pull request after local tests PASS');
       dryLog(plan, 'Would monitor GitHub CI and run bounded fix loop');
       dryLog(plan, 'Would never merge or publish');
-      return { code: 0, dryRun: true, plan, state, decision, task: taskCtx.task };
+      return done({ code: 0, dryRun: true, plan, state, decision, task: taskCtx.task });
     }
 
     if (!skipStartedHop && !skipImplementation) {
@@ -514,6 +537,7 @@ export async function runIssueAutomation({
       state.implementationAttempt = (state.implementationAttempt || 0) + 1;
       applyStage(state, fixContext ? 'FIXING' : 'IMPLEMENTING');
       state = await saveIssueState(state, env);
+      await emit('implementation_started', fixContext ? 'fix' : 'start', state.stage);
       if (typeof runImplementation !== 'function') {
         throw new Error('Implementation adapter is required.');
       }
@@ -529,6 +553,8 @@ export async function runIssueAutomation({
       const failed = result.ok === false || (config.tests.required && result.tests === 'FAIL');
       if (!failed) applyStage(state, 'LOCAL_TESTS');
       state = await saveIssueState(state, env);
+      await emit('implementation_completed', failed ? 'FAIL' : 'PASS', state.stage);
+      await emit('local_tests_completed', state.localTests || (failed ? 'FAIL' : 'PASS'), state.stage);
       return { failed, result };
     }
 
@@ -562,15 +588,18 @@ export async function runIssueAutomation({
       if (!remoteSkip.skip && typeof gitPush === 'function') {
         state.unsafePushPending = true;
         state = await saveIssueState(state, env);
+        await emit('push_started', state.branch, state.stage);
         try {
           const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
           rememberPushedSha(state, pushed);
           state.unsafePushPending = false;
           state.branchPushed = true;
           state = await saveIssueState(state, env);
+          await emit('push_completed', 'ok', state.stage);
         } catch (e) {
           state.lastFailure = e instanceof Error ? e.message : String(e);
           state = await saveIssueState(state, env);
+          await emit('push_completed', 'FAIL', state.stage);
           return { crashed: true };
         }
       }
@@ -595,6 +624,7 @@ export async function runIssueAutomation({
           });
           state.prNumber = pr.number;
           state = await saveIssueState(state, env);
+          await emit('pr_created', String(pr.number), state.stage);
         } catch (e) {
           state.lastFailure = e instanceof Error ? e.message : String(e);
           state = await saveIssueState(state, env);
@@ -609,24 +639,25 @@ export async function runIssueAutomation({
       if (first.stopped) {
         state = await saveIssueState(state, env);
         await applyLabels(client, { owner, name, issueNumber, issue, stage: 'CANCELLED', dryRun, plan });
-        return { code: 0, cancelled: true, plan, state, decision };
+        return done({ code: 0, cancelled: true, plan, state, decision });
       }
       if (first.failed) {
         applyStage(state, 'FAILED');
         state.lastFailure = 'local tests failed';
         state = await saveIssueState(state, env);
         await applyLabels(client, { owner, name, issueNumber, issue, stage: 'FAILED', dryRun, plan });
-        return { code: 1, plan, state };
+        return done({ code: 1, plan, state });
       }
     }
 
     if (!state.prNumber && (state.localTests === 'PASS' || state.localTests === 'SKIP')) {
       const pushed = await pushBranchAndOpenPr({ skipGitPush });
       if (pushed.crashed) {
-        return { code: 1, crashed: true, plan, state };
+        return done({ code: 1, crashed: true, plan, state });
       }
     }
     if (resumeWaitingForCi) {
+      await emit('ci_started', state.commitSha || state.branch, state.stage);
       const sync = await readGithubCiStatus({ client, owner, name, state });
       state.githubCi = sync.githubCi;
       applyStage(state, sync.stage);
@@ -635,6 +666,10 @@ export async function runIssueAutomation({
         state.lastFailure = '';
         state.pullRequestAutoMerged = false;
         state.published = false;
+      }
+      await emit('ci_completed', sync.githubCi, state.stage);
+      if (state.stage === 'HUMAN_REVIEW_REQUIRED') {
+        await emit('human_review_required', state.lastFailure || 'review', state.stage);
       }
       state = await saveIssueState(state, env);
       await applyLabels(client, { owner, name, issueNumber, issue, stage: state.stage, dryRun, plan });
@@ -652,13 +687,13 @@ export async function runIssueAutomation({
         });
         state = await saveIssueState(state, env);
       }
-      return {
+      return done({
         code: state.stage === 'FAILED' ? 1 : 0,
         plan,
         state,
         decision,
         waiting: state.stage === 'WAITING_FOR_CI',
-      };
+      });
     }
 
     if (state.stage !== 'FIXING') applyStage(state, 'WAITING_FOR_CI');
@@ -708,6 +743,7 @@ export async function runIssueAutomation({
         if (fix.failed) {
           applyStage(state, 'HUMAN_REVIEW_REQUIRED');
           state.lastDiagnosis = 'Local tests failed during CI fix round';
+          await emit('human_review_required', state.lastDiagnosis, state.stage);
           break;
         }
         assertSafePushBranch(state.branch);
@@ -718,15 +754,18 @@ export async function runIssueAutomation({
         } else if (typeof gitPush === 'function') {
           state.unsafePushPending = true;
           state = await saveIssueState(state, env);
+          await emit('push_started', state.branch, state.stage);
           try {
             const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
             rememberPushedSha(state, pushed);
             state.unsafePushPending = false;
             state.branchPushed = true;
+            await emit('push_completed', 'ok', state.stage);
           } catch (e) {
             state.lastFailure = e instanceof Error ? e.message : String(e);
             state = await saveIssueState(state, env);
-            return { code: 1, crashed: true, plan, state };
+            await emit('push_completed', 'FAIL', state.stage);
+            return done({ code: 1, crashed: true, plan, state });
           }
         }
         state = await upsertStatus(client, {
@@ -743,15 +782,18 @@ export async function runIssueAutomation({
         state = await saveIssueState(state, env);
       }
 
+      await emit('ci_started', state.commitSha || state.branch, state.stage);
       const ci = await poll({ ref: state.commitSha || state.branch, state });
       const status = typeof ci === 'string' ? ci : ci.status;
       if (status === CI_STATUS.PENDING) {
         state.githubCi = CI_STATUS.PENDING;
         applyStage(state, 'WAITING_FOR_CI');
         state = await saveIssueState(state, env);
-        return { code: 0, waiting: true, plan, state, decision };
+        await emit('ci_completed', 'PENDING', state.stage);
+        return done({ code: 0, waiting: true, plan, state, decision });
       }
       state = recordCiResult(state, status);
+      await emit('ci_completed', status, state.stage);
       if (ci && typeof ci === 'object') {
         state.lastFailure = redactCiText(ci.summary || status);
         if (ci.logs) {
@@ -771,6 +813,7 @@ export async function runIssueAutomation({
         if (!reviewOk || !testsOk) {
           applyStage(state, 'HUMAN_REVIEW_REQUIRED');
           state.lastDiagnosis = 'GitHub CI passed but required local tests or AI review did not pass';
+          await emit('human_review_required', state.lastDiagnosis, state.stage);
           break;
         }
         state = await upsertStatus(client, {
@@ -787,6 +830,7 @@ export async function runIssueAutomation({
         break;
       }
       if (state.stage === 'HUMAN_REVIEW_REQUIRED') {
+        await emit('human_review_required', state.lastFailure || 'review', state.stage);
         state = await upsertStatus(client, {
           owner, name, issueNumber, state, dryRun, plan,
           body: formatStatusComment({
@@ -813,7 +857,7 @@ export async function runIssueAutomation({
     state.pullRequestAutoMerged = false;
     state.published = false;
     state = await saveIssueState(state, env);
-    return { code: state.stage === 'READY_FOR_HUMAN_MERGE' ? 0 : 1, plan, state, decision };
+    return done({ code: state.stage === 'READY_FOR_HUMAN_MERGE' ? 0 : 1, plan, state, decision });
   } finally {
     if (!dryRun) await releaseIssueLock(slug, issueNumber, env);
   }
