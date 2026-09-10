@@ -42,6 +42,30 @@ test('HTTP client uses injected fetch and redacts secrets', async () => {
   assert.doesNotMatch(redactGithubText('token: ghp_LIVESECRET'), /LIVESECRET/);
 });
 
+test('getChecks and listWorkflowRuns request the GitHub CI endpoints', async () => {
+  const urls = [];
+  const fetchImpl = async (url) => {
+    urls.push(url);
+    return {
+      ok: true,
+      text: async () => JSON.stringify({
+        total_count: 1,
+        check_runs: [{ name: 'Node tests', status: 'completed', conclusion: 'success' }],
+        workflow_runs: [],
+      }),
+    };
+  };
+  const client = createGithubClient({ env: { GITHUB_TOKEN: 'ghp_LIVESECRET' }, fetchImpl });
+  const sha = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const checks = await client.getChecks('trisha918', 'ai-orchestrator-e2e-test', sha);
+  assert.equal(checks.total_count, 1);
+  assert.equal(checks.check_runs[0].conclusion, 'success');
+  await client.listWorkflowRuns('trisha918', 'ai-orchestrator-e2e-test', { headSha: sha });
+  assert.match(urls[0], /\/commits\/2d1d7a07bb537b06f07f1afa8aea2b580064a09f\/check-runs/);
+  assert.match(urls[1], /\/actions\/runs\?/);
+  assert.match(urls[1], /head_sha=2d1d7a07bb537b06f07f1afa8aea2b580064a09f/);
+});
+
 test('detectGithubAuth never includes credential values', () => {
   const a = detectGithubAuth({ GITHUB_TOKEN: 'ghp_SECRET' });
   assert.equal(a.ok, true);

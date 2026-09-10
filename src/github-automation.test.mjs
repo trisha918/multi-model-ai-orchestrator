@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseRepoConfigText } from './github-config.mjs';
 import { createMemoryGithubClient } from './github-client.mjs';
-import { decideTrigger, recordCiResult, runIssueAutomation, simulateGithubAutomation, CI_STATUS } from './github-automation.mjs';
+import { decideTrigger, recordCiResult, readGithubCiStatus, runIssueAutomation, simulateGithubAutomation, CI_STATUS } from './github-automation.mjs';
 import { acquireIssueLock, loadIssueState, saveIssueState, emptyState } from './github-state.mjs';
 import { TRIGGER_LABEL, STOP_LABEL } from './github-labels.mjs';
 import { authorizeAiAutoTrigger } from './github-auth.mjs';
@@ -65,6 +65,22 @@ test('manual mode skips issue automation', () => {
     authorization: { ok: true },
   });
   assert.equal(decision.action, 'skip');
+});
+
+test('disabled cwd config still resumes WAITING_FOR_CI', () => {
+  const decision = decideTrigger({
+    config: manual,
+    labels: [TRIGGER_LABEL],
+    authorization: { ok: true },
+    existingState: {
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      commitSha: '2d1d7a07bb537b06f07f1afa8aea2b580064a09f',
+      githubCi: 'UNKNOWN',
+    },
+  });
+  assert.equal(decision.action, 'resume');
+  assert.equal(decision.reason, 'WAITING_FOR_CI');
 });
 
 test('untrusted ai-auto is blocked', () => {
@@ -1004,6 +1020,179 @@ test('WAITING_FOR_CI with pending checks stays WAITING_FOR_CI', async () => {
     assert.equal(result.state.githubCi, 'UNKNOWN');
     assert.equal(result.state.prNumber, 7);
     assert.equal(result.waiting, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const nodeTestsSuccess = { name: 'Node tests', status: 'completed', conclusion: 'success' };
+
+test('readGithubCiStatus maps completed Node tests check to PASS', async () => {
+  const commit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const envelopeClient = {
+    async getPullRequest() {
+      return { head: { sha: commit } };
+    },
+    async getChecks() {
+      return { total_count: 1, check_runs: [nodeTestsSuccess] };
+    },
+  };
+  const envelope = await readGithubCiStatus({
+    client: envelopeClient,
+    owner: 'trisha918',
+    name: 'ai-orchestrator-e2e-test',
+    state: { prNumber: 7, commitSha: commit },
+  });
+  assert.equal(envelope.githubCi, 'PASS');
+  assert.equal(envelope.stage, 'READY_FOR_HUMAN_MERGE');
+
+  const singleRunClient = {
+    async getChecks() {
+      return nodeTestsSuccess;
+    },
+  };
+  const single = await readGithubCiStatus({
+    client: singleRunClient,
+    owner: 'trisha918',
+    name: 'ai-orchestrator-e2e-test',
+    state: { commitSha: commit },
+  });
+  assert.equal(single.githubCi, 'PASS');
+  assert.equal(single.stage, 'READY_FOR_HUMAN_MERGE');
+});
+
+test('readGithubCiStatus uses Actions workflow runs when check-runs are empty', async () => {
+  const commit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const sync = await readGithubCiStatus({
+    client: {
+      async getChecks() {
+        return { total_count: 0, check_runs: [] };
+      },
+      async listWorkflowRuns() {
+        return {
+          total_count: 1,
+          workflow_runs: [{ name: 'Node tests', status: 'completed', conclusion: 'success', head_sha: commit }],
+        };
+      },
+    },
+    owner: 'trisha918',
+    name: 'ai-orchestrator-e2e-test',
+    state: { commitSha: commit, prNumber: 7 },
+  });
+  assert.equal(sync.githubCi, 'PASS');
+  assert.equal(sync.stage, 'READY_FOR_HUMAN_MERGE');
+});
+
+test('WAITING_FOR_CI resume with Node tests Check API envelope becomes READY_FOR_HUMAN_MERGE', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const branch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: {
+      pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #6', issueNumber: 6 }],
+    },
+  }));
+  client.getChecks = async () => ({
+    total_count: 1,
+    check_runs: [nodeTestsSuccess],
+  });
+  let implCalls = 0;
+  let pushCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      githubCi: 'UNKNOWN',
+      localTests: 'PASS',
+      commitSha: commit,
+      branch,
+      mode: 'assisted',
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('must not re-implement while waiting for CI');
+      },
+      gitPush: async () => {
+        pushCalls += 1;
+        throw new Error('must not push while waiting for CI');
+      },
+      waitForCi: async () => {
+        throw new Error('resume CI sync should use GitHub checks, not the live waiter');
+      },
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(pushCalls, 0);
+    assert.equal(result.state.githubCi, 'PASS');
+    assert.equal(result.state.stage, 'READY_FOR_HUMAN_MERGE');
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.githubCi, 'PASS');
+    assert.equal(saved.stage, 'READY_FOR_HUMAN_MERGE');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('WAITING_FOR_CI resume with disabled cwd config still becomes READY_FOR_HUMAN_MERGE', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const branch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: {
+      pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #6', issueNumber: 6 }],
+    },
+  }));
+  client.getChecks = async () => ({
+    total_count: 1,
+    check_runs: [{ name: 'Node tests', status: 'completed', conclusion: 'success' }],
+  });
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      githubCi: 'UNKNOWN',
+      localTests: 'PASS',
+      commitSha: commit,
+      branch,
+      mode: 'assisted',
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: manual,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async () => {
+        throw new Error('must not re-implement while waiting for CI');
+      },
+      gitPush: async () => {
+        throw new Error('must not push while waiting for CI');
+      },
+      waitForCi: async () => {
+        throw new Error('resume CI sync should use GitHub checks, not the live waiter');
+      },
+    });
+    assert.equal(result.skipped, undefined);
+    assert.equal(result.state.githubCi, 'PASS');
+    assert.equal(result.state.stage, 'READY_FOR_HUMAN_MERGE');
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.githubCi, 'PASS');
+    assert.equal(saved.stage, 'READY_FOR_HUMAN_MERGE');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

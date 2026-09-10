@@ -287,3 +287,157 @@ review:
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('github resume from WAITING_FOR_CI maps Node tests success to READY_FOR_HUMAN_MERGE', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-resume-ci-'));
+  const env = { ...process.env, AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const branch = 'ai/issue-6-add-divide-operation-and-tests';
+  await mkdir(path.join(dir, '.github'), { recursive: true });
+  await writeFile(path.join(dir, '.github', 'ai-orchestrator.yml'), `automation:
+  enabled: true
+  mode: assisted
+review:
+  required: false
+`, 'utf8');
+  const client = createMemoryGithubClient({
+    issues: {
+      6: {
+        number: 6,
+        title: 'Add divide operation and tests',
+        body: 'requirements',
+        html_url: 'https://github.com/owner/app/issues/6',
+        user: { login: 'reporter' },
+        labels: [{ name: TRIGGER_LABEL }],
+      },
+    },
+    events: {
+      6: [{ event: 'labeled', label: { name: TRIGGER_LABEL }, actor: { login: 'maintainer' }, author_association: 'OWNER' }],
+    },
+    permissions: { maintainer: { permission: 'admin' } },
+    branches: ['main'],
+    repo: { default_branch: 'main', private: true },
+    pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #6', issueNumber: 6 }],
+  });
+  client.getChecks = async () => ({
+    total_count: 1,
+    check_runs: [{ name: 'Node tests', status: 'completed', conclusion: 'success' }],
+  });
+  const logs = [];
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      githubCi: 'UNKNOWN',
+      localTests: 'PASS',
+      commitSha: commit,
+      branch,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const code = await cmdGithub(parseGithubCli(['resume', '--repo', 'owner/app', '--issue', '6']), {
+      cwd: dir,
+      env,
+      clientFactory: async () => client,
+      runImplementation: async () => {
+        throw new Error('must not re-implement while waiting for CI');
+      },
+      gitPush: async () => {
+        throw new Error('must not push while waiting for CI');
+      },
+      waitForCi: async () => {
+        throw new Error('resume CI sync should use GitHub checks, not the live waiter');
+      },
+      stdout: s => logs.push(s),
+      stderr: s => logs.push(s),
+    });
+    assert.equal(code, 0);
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.githubCi, 'PASS');
+    assert.equal(saved.stage, 'READY_FOR_HUMAN_MERGE');
+    assert.match(logs.join('\n'), /READY_FOR_HUMAN_MERGE|PASS/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('github resume updates state file even when cwd automation yaml is disabled', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-resume-disabled-'));
+  const env = { ...process.env, AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const branch = 'ai/issue-6-add-divide-operation-and-tests';
+  await mkdir(path.join(dir, '.github'), { recursive: true });
+  await writeFile(path.join(dir, '.github', 'ai-orchestrator.yml'), `automation:
+  enabled: false
+  mode: manual
+`, 'utf8');
+  const client = createMemoryGithubClient({
+    issues: {
+      6: {
+        number: 6,
+        title: 'Add divide operation and tests',
+        body: 'requirements',
+        html_url: 'https://github.com/owner/app/issues/6',
+        user: { login: 'reporter' },
+        labels: [{ name: TRIGGER_LABEL }],
+      },
+    },
+    events: {
+      6: [{ event: 'labeled', label: { name: TRIGGER_LABEL }, actor: { login: 'maintainer' }, author_association: 'OWNER' }],
+    },
+    permissions: { maintainer: { permission: 'admin' } },
+    branches: ['main'],
+    repo: { default_branch: 'main', private: true },
+    pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #6', issueNumber: 6 }],
+  });
+  client.getChecks = async () => ({
+    total_count: 1,
+    check_runs: [{ name: 'Node tests', status: 'completed', conclusion: 'success' }],
+  });
+  const logs = [];
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      githubCi: 'UNKNOWN',
+      localTests: 'PASS',
+      commitSha: commit,
+      branch,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const code = await cmdGithub(parseGithubCli(['resume', '--repo', 'owner/app', '--issue', '6']), {
+      cwd: dir,
+      env,
+      clientFactory: async () => client,
+      runImplementation: async () => {
+        throw new Error('must not re-implement while waiting for CI');
+      },
+      gitPush: async () => {
+        throw new Error('must not push while waiting for CI');
+      },
+      waitForCi: async () => {
+        throw new Error('resume CI sync should use GitHub checks, not the live waiter');
+      },
+      stdout: s => logs.push(s),
+      stderr: s => logs.push(s),
+    });
+    assert.equal(code, 0);
+    assert.doesNotMatch(logs.join('\n'), /automation disabled/);
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.githubCi, 'PASS');
+    assert.equal(saved.stage, 'READY_FOR_HUMAN_MERGE');
+    assert.match(logs.join('\n'), /READY_FOR_HUMAN_MERGE/);
+    assert.match(logs.join('\n'), /PASS/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

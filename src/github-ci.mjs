@@ -8,12 +8,88 @@ export const CI_STATUS = Object.freeze({
 function normalizeConclusion(value) {
   const s = String(value || '').toLowerCase();
   if (['success', 'pass', 'passed', 'neutral', 'skipped'].includes(s)) return 'pass';
-  if (['failure', 'fail', 'failed', 'timed_out', 'cancelled', 'action_required', 'stale', 'startup_failure'].includes(s)) return 'fail';
+  if (['failure', 'fail', 'failed', 'timed_out', 'cancelled', 'action_required', 'stale', 'startup_failure', 'error'].includes(s)) return 'fail';
   return 'pending';
 }
 
+function isEnvelope(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+    && (Array.isArray(value.check_runs) || Array.isArray(value.checkRuns)
+      || Array.isArray(value.workflow_runs) || Array.isArray(value.statuses)
+      || Array.isArray(value.data?.check_runs)
+      || (value.check_runs && typeof value.check_runs === 'object'));
+}
+
+function fromCommitStatuses(statuses) {
+  return statuses.map((s) => {
+    const state = String(s.state || s.conclusion || '').toLowerCase();
+    return {
+      ...s,
+      name: s.context || s.name || 'status',
+      status: !state || state === 'pending' ? 'in_progress' : 'completed',
+      conclusion: s.conclusion || s.state || '',
+    };
+  });
+}
+
+/**
+ * Accept GitHub Check Runs API envelopes, workflow-run lists, combined statuses,
+ * a single check-run object, or an array of runs.
+ */
+export function extractCheckRuns(payload) {
+  if (payload == null) return [];
+  if (Array.isArray(payload)) {
+    return payload.flatMap((item) => (isEnvelope(item) ? extractCheckRuns(item) : [item]));
+  }
+  if (typeof payload !== 'object') return [];
+  if (Array.isArray(payload.check_runs)) return payload.check_runs;
+  if (payload.check_runs && typeof payload.check_runs === 'object') return [payload.check_runs];
+  if (Array.isArray(payload.checkRuns)) return payload.checkRuns;
+  if (Array.isArray(payload.data?.check_runs)) return payload.data.check_runs;
+  if (Array.isArray(payload.workflow_runs)) return payload.workflow_runs;
+  if (Array.isArray(payload.statuses)) {
+    if (payload.statuses.length) return fromCommitStatuses(payload.statuses);
+    const rollup = String(payload.state || '').toLowerCase();
+    if (rollup === 'success' || rollup === 'failure' || rollup === 'error') {
+      return [{
+        name: 'combined',
+        status: 'completed',
+        conclusion: rollup === 'success' ? 'success' : 'failure',
+      }];
+    }
+    return [];
+  }
+  if ('name' in payload || 'status' in payload || 'conclusion' in payload || 'context' in payload) {
+    return [payload];
+  }
+  return [];
+}
+
+async function safeExtract(load) {
+  try {
+    return extractCheckRuns(await load());
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchGithubCiRuns(client, owner, name, ref) {
+  if (!client || !ref) return [];
+  let runs = [];
+  if (typeof client.getChecks === 'function') {
+    runs = await safeExtract(() => client.getChecks(owner, name, ref));
+  }
+  if (!runs.length && typeof client.listWorkflowRuns === 'function') {
+    runs = await safeExtract(() => client.listWorkflowRuns(owner, name, { headSha: ref }));
+  }
+  if (!runs.length && typeof client.getCombinedStatus === 'function') {
+    runs = await safeExtract(() => client.getCombinedStatus(owner, name, ref));
+  }
+  return runs;
+}
+
 export function classifyCheckRuns(checkRuns = [], { now = Date.now(), timeoutMs = 60 * 60 * 1000, startedAt } = {}) {
-  const runs = Array.isArray(checkRuns) ? checkRuns : [];
+  const runs = extractCheckRuns(checkRuns);
   if (startedAt != null && startedAt !== '' && runs.length === 0) {
     const startMs = Number(new Date(startedAt).getTime());
     if (Number.isFinite(startMs) && Number(now) - startMs > timeoutMs) {

@@ -5,7 +5,7 @@ import { TRIGGER_LABEL, STOP_LABEL, resolveIssueRouting, RoutingConflictError, s
 import { authorizeAiAutoTrigger, extractLabelEventActor, BLOCK_UNTRUSTED } from './github-auth.mjs';
 import { buildIssueTaskContext } from './github-task.mjs';
 import { proposeBranchName, assertSafePushBranch, prTitleForIssue, prBodyForIssue, formatStatusComment, formatGithubStatus, MILESTONE_HEADLINES } from './github-pr.mjs';
-import { classifyCheckRuns, CI_STATUS, collectCiFailureContext, redactCiText } from './github-ci.mjs';
+import { classifyCheckRuns, CI_STATUS, collectCiFailureContext, redactCiText, fetchGithubCiRuns } from './github-ci.mjs';
 import { parseRepoSlug, emptyState, loadIssueState, saveIssueState, acquireIssueLock, releaseIssueLock } from './github-state.mjs';
 import { runtimeDirs } from './paths.mjs';
 
@@ -39,6 +39,11 @@ export function recordCiResult(state, status) {
   };
 }
 
+function hasExistingAutomation(existingState) {
+  const stage = existingState?.stage;
+  return Boolean(existingState && stage && stage !== 'IDLE');
+}
+
 export function decideTrigger({
   config,
   labels = [],
@@ -50,14 +55,19 @@ export function decideTrigger({
   if (names.includes(STOP_LABEL)) {
     return { action: 'cancel', reason: 'ai-stop label present' };
   }
-  if (!isIssueAutomationActive(config)) {
-    const mode = config?.automation?.mode || 'manual';
-    const enabled = Boolean(config?.automation?.enabled);
-    if (!enabled) return { action: 'skip', reason: 'automation disabled' };
-    return { action: 'skip', reason: `${mode} mode` };
-  }
-  if (!names.includes(config.automation.trigger_label || TRIGGER_LABEL)) {
-    return { action: 'skip', reason: 'trigger label absent' };
+  // Resume an in-progress issue even when cwd yaml is disabled/manual.
+  // `github resume --repo owner/name` is often run from another checkout
+  // (including this product repo, whose automation is off by default).
+  if (!hasExistingAutomation(existingState)) {
+    if (!isIssueAutomationActive(config)) {
+      const mode = config?.automation?.mode || 'manual';
+      const enabled = Boolean(config?.automation?.enabled);
+      if (!enabled) return { action: 'skip', reason: 'automation disabled' };
+      return { action: 'skip', reason: `${mode} mode` };
+    }
+    if (!names.includes(config.automation.trigger_label || TRIGGER_LABEL)) {
+      return { action: 'skip', reason: 'trigger label absent' };
+    }
   }
   if (!authorization?.ok) {
     return { action: 'block', reason: authorization?.reason || BLOCK_UNTRUSTED };
@@ -91,11 +101,7 @@ export async function readGithubCiStatus({ client, owner, name, state }) {
       /* use commit/branch already on state */
     }
   }
-  let runs = [];
-  if (typeof client.getChecks === 'function' && ref) {
-    const data = await client.getChecks(owner, name, ref);
-    runs = data?.check_runs || (Array.isArray(data) ? data : []);
-  }
+  const runs = await fetchGithubCiRuns(client, owner, name, ref);
   const classified = classifyCheckRuns(runs, { now: Date.now() });
   if (classified.status === CI_STATUS.PASS) {
     return { githubCi: 'PASS', stage: 'READY_FOR_HUMAN_MERGE', summary: classified.summary || '' };
@@ -402,8 +408,8 @@ export async function runIssueAutomation({
       && Boolean(state.branch && state.commitSha)
     );
 
-    state.mode = config.automation.mode;
-    state.maxAttempts = config.automation.max_fix_attempts;
+    if (decision.action !== 'resume' || !state.mode) state.mode = config.automation.mode;
+    state.maxAttempts = config.automation.max_fix_attempts || state.maxAttempts;
     state.route = routing.worker;
     state.model = routing.selection === 'MANUAL' ? routing.model : 'AUTO';
     state.selectedRoute = routing.worker;
@@ -563,7 +569,6 @@ export async function runIssueAutomation({
         return { code: 1, crashed: true, plan, state };
       }
     }
-
     if (resumeWaitingForCi) {
       const sync = await readGithubCiStatus({ client, owner, name, state });
       state.githubCi = sync.githubCi;
@@ -606,8 +611,8 @@ export async function runIssueAutomation({
     const poll = typeof waitForCi === 'function'
       ? waitForCi
       : async ({ ref }) => {
-        const checks = await client.getChecks(owner, name, ref);
-        return classifyCheckRuns(checks.check_runs || checks, { timeoutMs: ciTimeoutMs, startedAt: state.updatedAt });
+        const runs = await fetchGithubCiRuns(client, owner, name, ref);
+        return classifyCheckRuns(runs, { timeoutMs: ciTimeoutMs, startedAt: state.updatedAt });
       };
 
     while (state.stage === 'WAITING_FOR_CI' || state.stage === 'FIXING') {

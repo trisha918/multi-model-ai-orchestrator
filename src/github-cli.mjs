@@ -8,7 +8,7 @@ import { LABEL_DEFINITIONS } from './github-labels.mjs';
 import { parseRepoSlug } from './github-state.mjs';
 import { inspectIssueAutomation, runIssueAutomation, simulateGithubAutomation, implementationArgv, resumeIssueAutomation } from './github-automation.mjs';
 import { formatGithubStatus } from './github-pr.mjs';
-import { classifyCheckRuns, CI_STATUS } from './github-ci.mjs';
+import { classifyCheckRuns, CI_STATUS, fetchGithubCiRuns } from './github-ci.mjs';
 import { runTask } from './orchestrator.mjs';
 import { git } from './workspace.mjs';
 import { collectGithubDoctor, formatGithubDoctor } from './github-doctor.mjs';
@@ -128,12 +128,12 @@ export async function defaultGitPush({ branch, repo }) {
 export async function waitForGithubCi({ client, owner, name, ref, timeoutMs = 60 * 60 * 1000 }) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const checks = await client.getChecks(owner, name, ref);
-    const classified = classifyCheckRuns(checks.check_runs || [], { now: Date.now(), timeoutMs, startedAt: new Date(started).toISOString() });
+    const runs = await fetchGithubCiRuns(client, owner, name, ref);
+    const classified = classifyCheckRuns(runs, { now: Date.now(), timeoutMs, startedAt: new Date(started).toISOString() });
     if (classified.status !== CI_STATUS.PENDING) {
       if (classified.status === CI_STATUS.FAIL) {
         try {
-          const logs = await client.getLogs(owner, name, checks.check_runs?.[0]?.id);
+          const logs = await client.getLogs(owner, name, runs?.[0]?.id);
           classified.logs = typeof logs === 'string' ? logs : JSON.stringify(logs).slice(0, 8000);
         } catch {
           classified.logs = '(unavailable)';
@@ -269,9 +269,12 @@ export async function cmdGithub(parsed, {
       for (const step of result.plan.steps) stdout(`- ${step.message}`);
       return 0;
     }
+    if (result.skipped || result.blocked || result.conflict) {
+      stdout(`Trigger decision: ${result.decision?.action || 'skip'} (${result.decision?.reason || ''})`);
+    }
     stdout(formatGithubStatus({
       issue: { number: issueNumber, title: result.state?.issueTitle },
-      automationMode: config.automation.mode,
+      automationMode: result.state?.mode || config.automation.mode,
       state: result.state,
     }));
     return result.code ?? 0;

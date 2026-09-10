@@ -175,7 +175,12 @@ export function createGithubClient({
       return request('GET', `/repos/${owner}/${name}/pulls?${params}`);
     },
     async getChecks(owner, name, ref) {
-      return request('GET', `/repos/${owner}/${name}/commits/${encodeURIComponent(ref)}/check-runs`);
+      return request('GET', `/repos/${owner}/${name}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`);
+    },
+    async listWorkflowRuns(owner, name, { headSha } = {}) {
+      const params = new URLSearchParams({ per_page: '20' });
+      if (headSha) params.set('head_sha', headSha);
+      return request('GET', `/repos/${owner}/${name}/actions/runs?${params}`);
     },
     async getCombinedStatus(owner, name, ref) {
       return request('GET', `/repos/${owner}/${name}/commits/${encodeURIComponent(ref)}/status`);
@@ -315,6 +320,12 @@ export function createMemoryGithubClient(seed = {}) {
       log.push({ op: 'getChecks', ref });
       const runs = checksByRef[ref] || checksByRef[String(ref)] || [];
       return { check_runs: runs };
+    },
+    async listWorkflowRuns(owner, name, { headSha } = {}) {
+      log.push({ op: 'listWorkflowRuns', headSha });
+      const map = seed.workflowRuns || {};
+      const runs = map[headSha] || map[String(headSha || '')] || [];
+      return { workflow_runs: runs };
     },
     async getCombinedStatus() {
       return { statuses: [], state: 'pending' };

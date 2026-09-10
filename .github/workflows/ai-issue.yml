@@ -18,6 +18,7 @@ permissions:
   contents: write
   issues: write
   pull-requests: write
+  checks: read
   actions: read
 
 jobs:
@@ -101,6 +102,7 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
+      checks: read
       actions: read
     steps:
       - name: Checkout default branch only
@@ -115,7 +117,11 @@ jobs:
         shell: powershell
         run: |
           if (-not $env:ISSUE_NUMBER) { throw 'Missing issue number' }
-          ai-orchestrator @('github','authorize','--repo',$env:GITHUB_REPOSITORY,'--issue',$env:ISSUE_NUMBER)
+          $npmRoot = (& cmd.exe /d /s /c 'npm root -g').Trim()
+          $entry = Join-Path $npmRoot 'multi-model-ai-orchestrator\bin\ai-orchestrator.mjs'
+          if (-not (Test-Path -LiteralPath $entry)) { throw "Missing orchestrator CLI: $entry" }
+          & node.exe $entry @('github','authorize','--repo',$env:GITHUB_REPOSITORY,'--issue',$env:ISSUE_NUMBER)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run orchestrator GitHub automation
         env:
@@ -124,4 +130,8 @@ jobs:
         shell: powershell
         run: |
           if (-not $env:ISSUE_NUMBER) { throw 'Missing issue number' }
-          ai-orchestrator @('github','issue','run','--repo',$env:GITHUB_REPOSITORY,'--issue',$env:ISSUE_NUMBER)
+          $npmRoot = (& cmd.exe /d /s /c 'npm root -g').Trim()
+          $entry = Join-Path $npmRoot 'multi-model-ai-orchestrator\bin\ai-orchestrator.mjs'
+          if (-not (Test-Path -LiteralPath $entry)) { throw "Missing orchestrator CLI: $entry" }
+          & node.exe $entry @('github','issue','run','--repo',$env:GITHUB_REPOSITORY,'--issue',$env:ISSUE_NUMBER)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
