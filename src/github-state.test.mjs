@@ -16,6 +16,11 @@ import {
   IllegalStageTransitionError,
   TERMINAL_STAGES,
   COMPLETE_STAGES,
+  AUTOMATION_STAGES,
+  ALLOWED_TRANSITIONS,
+  AUDIT_STAGES,
+  AUDIT_STAGE_TRANSITIONS,
+  transitionsFrom,
 } from './github-state.mjs';
 
 test('state persists without credentials', async () => {
@@ -64,10 +69,12 @@ const legal = [
   ['IDLE', 'STARTED'],
   ['IDLE', 'WORKING'],
   ['IDLE', 'BLOCKED'],
+  ['IDLE', 'WAITING_FOR_CI'],
   ['STARTED', 'WORKING'],
   ['WORKING', 'IMPLEMENTING'],
   ['IMPLEMENTING', 'LOCAL_TESTS'],
   ['IMPLEMENTING', 'FAILED'],
+  ['IMPLEMENTING', 'WAITING_FOR_CI'],
   ['LOCAL_TESTS', 'WAITING_FOR_CI'],
   ['WAITING_FOR_CI', 'READY_FOR_HUMAN_MERGE'],
   ['WAITING_FOR_CI', 'FIXING'],
@@ -97,6 +104,7 @@ const illegal = [
   ['HUMAN_REVIEW_REQUIRED', 'IMPLEMENTING'],
   ['HUMAN_REVIEW_REQUIRED', 'READY_FOR_HUMAN_MERGE'],
   ['WAITING_FOR_CI', 'IMPLEMENTING'],
+  ['IMPLEMENTING', 'STARTED'],
   ['IDLE', 'READY_FOR_HUMAN_MERGE'],
   ['LOCAL_TESTS', 'READY_FOR_HUMAN_MERGE'],
 ];
@@ -173,4 +181,30 @@ test('saveIssueState is atomic and survives a crash-shaped rewrite', async () =>
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('audit stages document every allowed and impossible transition', () => {
+  assert.deepEqual([...AUDIT_STAGES], [
+    'STARTED',
+    'LOCAL_TESTS',
+    'WAITING_FOR_CI',
+    'READY_FOR_HUMAN_MERGE',
+    'HUMAN_REVIEW_REQUIRED',
+    'FAILED',
+    'BLOCKED',
+    'DONE',
+  ]);
+  for (const from of AUDIT_STAGES) {
+    assert.deepEqual(transitionsFrom(from), [...(ALLOWED_TRANSITIONS[from] || [])]);
+    assert.equal(AUDIT_STAGE_TRANSITIONS[from], ALLOWED_TRANSITIONS[from]);
+    for (const to of AUTOMATION_STAGES) {
+      const expected = from === to || (ALLOWED_TRANSITIONS[from] || []).includes(to);
+      assert.equal(isAllowedTransition(from, to), expected, `${from} → ${to}`);
+    }
+  }
+  assert.deepEqual(transitionsFrom('FAILED'), []);
+  assert.deepEqual(transitionsFrom('BLOCKED'), []);
+  assert.deepEqual(transitionsFrom('DONE'), []);
+  assert.deepEqual(transitionsFrom('READY_FOR_HUMAN_MERGE'), ['DONE', 'HUMAN_REVIEW_REQUIRED']);
+  assert.deepEqual(transitionsFrom('HUMAN_REVIEW_REQUIRED'), ['WAITING_FOR_CI', 'LOCAL_TESTS']);
 });

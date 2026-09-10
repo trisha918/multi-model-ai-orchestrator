@@ -315,3 +315,55 @@ test('concurrency lock still excludes a second holder after exclusive create', a
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('resume from IMPLEMENTING without a PR continues without rewinding to STARTED', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-impl-resume-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const implCommit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
+  const implBranch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6));
+  let implCalls = 0;
+  let pushCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'IMPLEMENTING',
+      localTests: 'UNKNOWN',
+      commitSha: '',
+      branch: implBranch,
+      prNumber: null,
+      mode: 'assisted',
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async ({ branch }) => {
+        implCalls += 1;
+        assert.equal(branch, implBranch);
+        return { ok: true, tests: 'PASS', commit: implCommit, branch };
+      },
+      gitPush: async ({ branch }) => {
+        pushCalls += 1;
+        assert.equal(branch, implBranch);
+        return { sha: implCommit };
+      },
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'pending' }),
+    });
+    assert.equal(implCalls, 1);
+    assert.equal(pushCalls, 1);
+    assert.equal(result.state.stage, 'WAITING_FOR_CI');
+    assert.equal(result.state.commitSha, implCommit);
+    assert.equal(Boolean(result.state.prNumber), true);
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.stage, 'WAITING_FOR_CI');
+    assert.equal(saved.branchPushed, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

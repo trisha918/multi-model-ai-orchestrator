@@ -22,7 +22,7 @@ import {
 import { runtimeDirs } from './paths.mjs';
 
 export { CI_STATUS };
-export { isAllowedTransition, transitionStage, applyStage, ALLOWED_TRANSITIONS, AUDIT_STAGES, AUDIT_STAGE_TRANSITIONS, transitionsFrom } from './github-state.mjs';
+export { isAllowedTransition, transitionStage, applyStage, ALLOWED_TRANSITIONS } from './github-state.mjs';
 
 export function recordCiResult(state, status) {
   if (isSettledStage(state?.stage)) {
@@ -425,6 +425,7 @@ export async function runIssueAutomation({
     if (existingPrs.length && !state.prNumber) {
       state.prNumber = existingPrs[0].number;
       state.branch = existingPrs[0].head?.ref || existingPrs[0].head || state.branch;
+      if (!dryRun) state = await saveIssueState(state, env);
     }
 
     if (decision.action === 'resume' && state.unsafePushPending) {
@@ -455,7 +456,11 @@ export async function runIssueAutomation({
       && Boolean(state.branch && state.commitSha)
     );
 
-    const skipRestart = resumeLocalTests || (decision.action === 'resume' && Boolean(state.prNumber));
+    // Resume from IMPLEMENTING/FIXING/LOCAL_TESTS must not rewind to STARTED
+    // (IMPLEMENTING → STARTED is illegal).
+    const skipStartedHop = decision.action === 'resume'
+      && !['IDLE', 'STARTED'].includes(state.stage || 'IDLE');
+    const skipImplementation = Boolean(state.prNumber) || resumeLocalTests;
 
     if (decision.action !== 'resume' || !state.mode) state.mode = config.automation.mode;
     state.maxAttempts = config.automation.max_fix_attempts || state.maxAttempts;
@@ -463,7 +468,7 @@ export async function runIssueAutomation({
     state.model = routing.selection === 'MANUAL' ? routing.model : 'AUTO';
     state.selectedRoute = routing.worker;
     state.selectedModels = state.model;
-    if (!skipRestart) applyStage(state, 'STARTED');
+    if (!skipStartedHop) applyStage(state, 'STARTED');
 
     const taskCtx = buildIssueTaskContext({ issue, repository: slug, routing });
 
@@ -476,7 +481,7 @@ export async function runIssueAutomation({
       return { code: 0, dryRun: true, plan, state, decision, task: taskCtx.task };
     }
 
-    if (!skipRestart) {
+    if (!skipStartedHop && !skipImplementation) {
       await applyLabels(client, { owner, name, issueNumber, issue, stage: 'WORKING', dryRun, plan });
       applyStage(state, 'WORKING');
       state = await upsertStatus(client, {
@@ -599,7 +604,7 @@ export async function runIssueAutomation({
       return { crashed: false };
     }
 
-    if (!state.prNumber && !resumeLocalTests) {
+    if (!skipImplementation) {
       const first = await implementRound();
       if (first.stopped) {
         state = await saveIssueState(state, env);
@@ -656,8 +661,8 @@ export async function runIssueAutomation({
       };
     }
 
-    applyStage(state, 'WAITING_FOR_CI');
-    await applyLabels(client, { owner, name, issueNumber, issue, stage: 'WAITING_FOR_CI', dryRun, plan });
+    if (state.stage !== 'FIXING') applyStage(state, 'WAITING_FOR_CI');
+    await applyLabels(client, { owner, name, issueNumber, issue, stage: state.stage, dryRun, plan });
     state = await saveIssueState(state, env);
 
     const poll = typeof waitForCi === 'function'
