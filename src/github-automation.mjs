@@ -6,12 +6,28 @@ import { authorizeAiAutoTrigger, extractLabelEventActor, BLOCK_UNTRUSTED } from 
 import { buildIssueTaskContext } from './github-task.mjs';
 import { proposeBranchName, assertSafePushBranch, prTitleForIssue, prBodyForIssue, formatStatusComment, formatGithubStatus, MILESTONE_HEADLINES } from './github-pr.mjs';
 import { classifyCheckRuns, CI_STATUS, collectCiFailureContext, redactCiText, fetchGithubCiRuns } from './github-ci.mjs';
-import { parseRepoSlug, emptyState, loadIssueState, saveIssueState, acquireIssueLock, releaseIssueLock } from './github-state.mjs';
+import {
+  parseRepoSlug,
+  emptyState,
+  loadIssueState,
+  saveIssueState,
+  acquireIssueLock,
+  releaseIssueLock,
+  applyStage,
+  transitionStage,
+  isSettledStage,
+  COMPLETE_STAGES,
+  STOPPED_STAGES,
+} from './github-state.mjs';
 import { runtimeDirs } from './paths.mjs';
 
 export { CI_STATUS };
+export { isAllowedTransition, transitionStage, applyStage, ALLOWED_TRANSITIONS } from './github-state.mjs';
 
 export function recordCiResult(state, status) {
+  if (isSettledStage(state?.stage)) {
+    return { ...state };
+  }
   const attempt = (state.ciAttempts || 0) + 1;
   const max = state.maxAttempts || 5;
   const next = {
@@ -21,22 +37,24 @@ export function recordCiResult(state, status) {
     githubCi: status,
     lastCiRun: status,
   };
+  let dest = 'FIXING';
   if (status === CI_STATUS.PASS) {
-    return { ...next, stage: 'READY_FOR_HUMAN_MERGE', lastFailure: '' };
+    next.lastFailure = '';
+    dest = 'READY_FOR_HUMAN_MERGE';
+  } else if (attempt >= max) {
+    next.lastFailure = status;
+    dest = 'HUMAN_REVIEW_REQUIRED';
+  } else {
+    next.aiFixRound = (state.aiFixRound || 0) + 1;
+    next.lastFailure = status;
+    dest = 'FIXING';
   }
-  if (attempt >= max) {
-    return {
-      ...next,
-      stage: 'HUMAN_REVIEW_REQUIRED',
-      lastFailure: status,
-    };
+  const moved = transitionStage(next, dest, { onIllegal: 'noop' });
+  if (moved.transitionApplied === false && (state.stage || 'IDLE') !== dest) {
+    return { ...state };
   }
-  return {
-    ...next,
-    stage: 'FIXING',
-    aiFixRound: (state.aiFixRound || 0) + 1,
-    lastFailure: status,
-  };
+  delete moved.transitionApplied;
+  return moved;
 }
 
 function hasExistingAutomation(existingState) {
@@ -69,21 +87,21 @@ export function decideTrigger({
       return { action: 'skip', reason: 'trigger label absent' };
     }
   }
+  const stage = existingState?.stage;
+  if (COMPLETE_STAGES.includes(stage)) {
+    return { action: 'already-complete', reason: stage, state: existingState };
+  }
+  if (STOPPED_STAGES.includes(stage) && !(stage === 'HUMAN_REVIEW_REQUIRED' && existingState?.unsafePushPending)) {
+    return { action: 'already-stopped', reason: stage, state: existingState };
+  }
   if (!authorization?.ok) {
     return { action: 'block', reason: authorization?.reason || BLOCK_UNTRUSTED };
   }
   if (lockHeld) {
     return { action: 'busy', reason: 'concurrency lock held' };
   }
-  const stage = existingState?.stage;
-  if (stage === 'READY_FOR_HUMAN_MERGE' || stage === 'DONE') {
-    return { action: 'already-complete', reason: stage, state: existingState };
-  }
   if (stage === 'HUMAN_REVIEW_REQUIRED' && existingState?.unsafePushPending) {
     return { action: 'resume', reason: 'unsafe-push-pending', state: existingState };
-  }
-  if (stage === 'HUMAN_REVIEW_REQUIRED' || stage === 'CANCELLED' || stage === 'FAILED' || stage === 'BLOCKED' || stage === 'CONFLICT') {
-    return { action: 'already-stopped', reason: stage, state: existingState };
   }
   if (existingState && stage && stage !== 'IDLE') {
     return { action: 'resume', reason: stage, state: existingState };
@@ -123,6 +141,26 @@ function applyImplementationResult(state, result, config) {
   if (result?.route) state.route = result.route;
   if (result?.model) state.model = result.model;
   if (result?.branch) state.branch = result.branch;
+  state.branchPushed = false;
+}
+
+export async function shouldSkipGitPush({ client, owner, name, state } = {}) {
+  if (state?.prNumber) return { skip: true, reason: 'pr-exists' };
+  if (state?.branchPushed && state.commitSha && !state.unsafePushPending) {
+    return { skip: true, reason: 'branch-already-pushed' };
+  }
+  if (typeof client?.getBranch === 'function' && state?.branch && state?.commitSha) {
+    try {
+      const remote = await client.getBranch(owner, name, state.branch);
+      const sha = remoteCommitSha(remote);
+      if (sha && commitShasMatch(sha, state.commitSha)) {
+        return { skip: true, reason: 'remote-sha-matches' };
+      }
+    } catch {
+      /* fall through to push */
+    }
+  }
+  return { skip: false, reason: '' };
 }
 
 function rememberPushedSha(state, pushed) {
@@ -207,26 +245,28 @@ export async function simulateGithubAutomation(fixture = {}) {
   let state = fixture.existingState || emptyState({ repo: fixture.repo || 'owner/app', issue });
   state.mode = config.automation.mode;
   state.maxAttempts = config.automation.max_fix_attempts;
-  state.stage = 'WORKING';
+  if (decision.action !== 'resume' || state.stage === 'IDLE' || state.stage === 'STARTED') {
+    applyStage(state, 'WORKING');
+  }
   state.implementationAttempt = 1;
   state.localTests = fixture.localTests || 'PASS';
   state.route = fixture.route || 'CODEX';
   state.model = fixture.model || 'auto';
   if (state.localTests !== 'PASS' && state.localTests !== 'SKIP') {
-    state.stage = 'FAILED';
+    applyStage(state, 'FAILED');
     return { ok: false, state, decision };
   }
 
   const sequence = fixture.ciSequence || [CI_STATUS.PASS];
   for (const status of sequence) {
-    state.stage = 'WAITING_FOR_CI';
+    applyStage(state, 'WAITING_FOR_CI');
     state = recordCiResult(state, status);
     if (state.stage === 'READY_FOR_HUMAN_MERGE') break;
     if (state.stage === 'HUMAN_REVIEW_REQUIRED') break;
     if (state.stage === 'FIXING') {
       state.localTests = fixture.fixLocalTests || 'PASS';
       if (state.localTests !== 'PASS' && state.localTests !== 'SKIP') {
-        state.stage = 'HUMAN_REVIEW_REQUIRED';
+        applyStage(state, 'HUMAN_REVIEW_REQUIRED');
         break;
       }
     }
@@ -346,7 +386,7 @@ export async function runIssueAutomation({
   }
   if (decision.action === 'block') {
     let state = inspected.state || emptyState({ repo: slug, issue });
-    state.stage = 'BLOCKED';
+    applyStage(state, 'BLOCKED');
     state.lastFailure = BLOCK_UNTRUSTED;
     if (!dryRun) state = await saveIssueState(state, env);
     const body = formatStatusComment({
@@ -360,7 +400,7 @@ export async function runIssueAutomation({
 
   if (routingError) {
     let state = inspected.state || emptyState({ repo: slug, issue });
-    state.stage = 'CONFLICT';
+    applyStage(state, 'CONFLICT');
     state.lastFailure = routingError;
     if (!dryRun) state = await saveIssueState(state, env);
     const body = formatStatusComment({
@@ -380,10 +420,17 @@ export async function runIssueAutomation({
   try {
     let state = inspected.state || emptyState({ repo: slug, issue });
     let skipGitPush = false;
+
+    const existingPrs = await client.listPullsForIssue(owner, name, issueNumber);
+    if (existingPrs.length && !state.prNumber) {
+      state.prNumber = existingPrs[0].number;
+      state.branch = existingPrs[0].head?.ref || existingPrs[0].head || state.branch;
+    }
+
     if (decision.action === 'resume' && state.unsafePushPending) {
       const rec = await reconcileUnsafePushPending({ client, owner, name, state });
       if (rec.action !== 'reconciled') {
-        state.stage = 'HUMAN_REVIEW_REQUIRED';
+        applyStage(state, 'HUMAN_REVIEW_REQUIRED');
         state.lastDiagnosis = rec.reason;
         if (!dryRun) state = await saveIssueState(state, env);
         await applyLabels(client, { owner, name, issueNumber, issue, stage: 'HUMAN_REVIEW_REQUIRED', dryRun, plan });
@@ -408,13 +455,15 @@ export async function runIssueAutomation({
       && Boolean(state.branch && state.commitSha)
     );
 
+    const skipRestart = resumeLocalTests || (decision.action === 'resume' && Boolean(state.prNumber));
+
     if (decision.action !== 'resume' || !state.mode) state.mode = config.automation.mode;
     state.maxAttempts = config.automation.max_fix_attempts || state.maxAttempts;
     state.route = routing.worker;
     state.model = routing.selection === 'MANUAL' ? routing.model : 'AUTO';
     state.selectedRoute = routing.worker;
     state.selectedModels = state.model;
-    if (!resumeLocalTests) state.stage = 'STARTED';
+    if (!skipRestart) applyStage(state, 'STARTED');
 
     const taskCtx = buildIssueTaskContext({ issue, repository: slug, routing });
 
@@ -427,9 +476,9 @@ export async function runIssueAutomation({
       return { code: 0, dryRun: true, plan, state, decision, task: taskCtx.task };
     }
 
-    if (!resumeLocalTests) {
+    if (!skipRestart) {
       await applyLabels(client, { owner, name, issueNumber, issue, stage: 'WORKING', dryRun, plan });
-      state.stage = 'WORKING';
+      applyStage(state, 'WORKING');
       state = await upsertStatus(client, {
         owner,
         name,
@@ -448,23 +497,17 @@ export async function runIssueAutomation({
       state = await saveIssueState(state, env);
     }
 
-    const existingPrs = await client.listPullsForIssue(owner, name, issueNumber);
-    if (existingPrs.length && !state.prNumber) {
-      state.prNumber = existingPrs[0].number;
-      state.branch = existingPrs[0].head?.ref || state.branch;
-    }
-
     const branches = (await client.listBranches(owner, name)).map(b => b.name);
     if (!state.branch) state.branch = proposeBranchName(issue, { existingBranches: branches });
 
     async function implementRound({ fixContext } = {}) {
       const namesNow = (await client.getLabels(owner, name, issueNumber)).map(l => l.name || l);
       if (namesNow.includes(STOP_LABEL)) {
-        state.stage = 'CANCELLED';
+        applyStage(state, 'CANCELLED');
         return { stopped: true };
       }
       state.implementationAttempt = (state.implementationAttempt || 0) + 1;
-      state.stage = fixContext ? 'FIXING' : 'IMPLEMENTING';
+      applyStage(state, fixContext ? 'FIXING' : 'IMPLEMENTING');
       state = await saveIssueState(state, env);
       if (typeof runImplementation !== 'function') {
         throw new Error('Implementation adapter is required.');
@@ -479,7 +522,7 @@ export async function runIssueAutomation({
       });
       applyImplementationResult(state, result, config);
       const failed = result.ok === false || (config.tests.required && result.tests === 'FAIL');
-      if (!failed) state.stage = 'LOCAL_TESTS';
+      if (!failed) applyStage(state, 'LOCAL_TESTS');
       state = await saveIssueState(state, env);
       return { failed, result };
     }
@@ -500,16 +543,25 @@ export async function runIssueAutomation({
       if (existing?.number) {
         state.prNumber = existing.number;
         state.unsafePushPending = false;
+        state.branchPushed = true;
         state = await saveIssueState(state, env);
         return { crashed: false };
       }
-      if (!skipPush && typeof gitPush === 'function') {
+      const remoteSkip = skipPush
+        ? { skip: true, reason: 'caller' }
+        : await shouldSkipGitPush({ client, owner, name, state });
+      if (remoteSkip.skip && remoteSkip.reason !== 'caller') {
+        state.branchPushed = true;
+        state.unsafePushPending = false;
+      }
+      if (!remoteSkip.skip && typeof gitPush === 'function') {
         state.unsafePushPending = true;
         state = await saveIssueState(state, env);
         try {
           const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
           rememberPushedSha(state, pushed);
           state.unsafePushPending = false;
+          state.branchPushed = true;
           state = await saveIssueState(state, env);
         } catch (e) {
           state.lastFailure = e instanceof Error ? e.message : String(e);
@@ -555,7 +607,7 @@ export async function runIssueAutomation({
         return { code: 0, cancelled: true, plan, state, decision };
       }
       if (first.failed) {
-        state.stage = 'FAILED';
+        applyStage(state, 'FAILED');
         state.lastFailure = 'local tests failed';
         state = await saveIssueState(state, env);
         await applyLabels(client, { owner, name, issueNumber, issue, stage: 'FAILED', dryRun, plan });
@@ -572,7 +624,7 @@ export async function runIssueAutomation({
     if (resumeWaitingForCi) {
       const sync = await readGithubCiStatus({ client, owner, name, state });
       state.githubCi = sync.githubCi;
-      state.stage = sync.stage;
+      applyStage(state, sync.stage);
       if (sync.githubCi === 'FAIL') state.lastFailure = sync.summary || 'GitHub CI failed';
       if (sync.githubCi === 'PASS') {
         state.lastFailure = '';
@@ -604,7 +656,7 @@ export async function runIssueAutomation({
       };
     }
 
-    state.stage = 'WAITING_FOR_CI';
+    applyStage(state, 'WAITING_FOR_CI');
     await applyLabels(client, { owner, name, issueNumber, issue, stage: 'WAITING_FOR_CI', dryRun, plan });
     state = await saveIssueState(state, env);
 
@@ -618,7 +670,7 @@ export async function runIssueAutomation({
     while (state.stage === 'WAITING_FOR_CI' || state.stage === 'FIXING') {
       const namesNow = (await client.getLabels(owner, name, issueNumber)).map(l => l.name || l);
       if (namesNow.includes(STOP_LABEL)) {
-        state.stage = 'CANCELLED';
+        applyStage(state, 'CANCELLED');
         break;
       }
       if (state.stage === 'FIXING') {
@@ -645,22 +697,27 @@ export async function runIssueAutomation({
         });
         const fix = await implementRound({ fixContext });
         if (fix.stopped) {
-          state.stage = 'CANCELLED';
+          applyStage(state, 'CANCELLED');
           break;
         }
         if (fix.failed) {
-          state.stage = 'HUMAN_REVIEW_REQUIRED';
+          applyStage(state, 'HUMAN_REVIEW_REQUIRED');
           state.lastDiagnosis = 'Local tests failed during CI fix round';
           break;
         }
         assertSafePushBranch(state.branch);
-        if (typeof gitPush === 'function') {
+        const fixSkip = await shouldSkipGitPush({ client, owner, name, state });
+        if (fixSkip.skip) {
+          state.branchPushed = true;
+          state.unsafePushPending = false;
+        } else if (typeof gitPush === 'function') {
           state.unsafePushPending = true;
           state = await saveIssueState(state, env);
           try {
             const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
             rememberPushedSha(state, pushed);
             state.unsafePushPending = false;
+            state.branchPushed = true;
           } catch (e) {
             state.lastFailure = e instanceof Error ? e.message : String(e);
             state = await saveIssueState(state, env);
@@ -676,7 +733,7 @@ export async function runIssueAutomation({
             maxAttempts: state.maxAttempts,
           }),
         });
-        state.stage = 'WAITING_FOR_CI';
+        applyStage(state, 'WAITING_FOR_CI');
         await applyLabels(client, { owner, name, issueNumber, issue, stage: 'WAITING_FOR_CI', dryRun, plan });
         state = await saveIssueState(state, env);
       }
@@ -685,7 +742,7 @@ export async function runIssueAutomation({
       const status = typeof ci === 'string' ? ci : ci.status;
       if (status === CI_STATUS.PENDING) {
         state.githubCi = CI_STATUS.PENDING;
-        state.stage = 'WAITING_FOR_CI';
+        applyStage(state, 'WAITING_FOR_CI');
         state = await saveIssueState(state, env);
         return { code: 0, waiting: true, plan, state, decision };
       }
@@ -707,7 +764,7 @@ export async function runIssueAutomation({
         const reviewOk = !config.review.required || state.review === 'PASS' || state.review === 'SKIP';
         const testsOk = !config.tests.required || state.localTests === 'PASS' || state.localTests === 'SKIP';
         if (!reviewOk || !testsOk) {
-          state.stage = 'HUMAN_REVIEW_REQUIRED';
+          applyStage(state, 'HUMAN_REVIEW_REQUIRED');
           state.lastDiagnosis = 'GitHub CI passed but required local tests or AI review did not pass';
           break;
         }

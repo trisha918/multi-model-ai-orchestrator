@@ -34,6 +34,28 @@ Assisted mode pushes **only** the `ai/issue-...` branch (never `main`, never for
 
 ## State machine
 
+Canonical allowed transitions live in `src/github-state.mjs` (`ALLOWED_TRANSITIONS`). Illegal moves are rejected.
+
+| From | To | Trigger |
+| --- | --- | --- |
+| IDLE | STARTED / WORKING | Trusted `ai-auto` start |
+| IDLE | BLOCKED | Untrusted trigger actor |
+| IDLE | CONFLICT | Contradictory route/model labels |
+| STARTED / WORKING | IMPLEMENTING | First implementation round |
+| IMPLEMENTING | LOCAL_TESTS | Independent local tests PASS/SKIP |
+| IMPLEMENTING | FAILED | Local tests FAIL |
+| LOCAL_TESTS | WAITING_FOR_CI | Branch on remote + PR opened or reused |
+| WAITING_FOR_CI | READY_FOR_HUMAN_MERGE | GitHub CI PASS |
+| WAITING_FOR_CI | FIXING | CI FAIL/TIMEOUT and attempts remain |
+| WAITING_FOR_CI | HUMAN_REVIEW_REQUIRED | Attempt limit, or CI PASS but required review/tests did not |
+| WAITING_FOR_CI | FAILED | Resume CI sync sees FAIL (no extra fix start) |
+| FIXING | WAITING_FOR_CI | Fix pushed (never force-push) |
+| READY_FOR_HUMAN_MERGE | DONE | Human merged / closed (never auto-merge) |
+| HUMAN_REVIEW_REQUIRED | WAITING_FOR_CI | Crash-recovery reconcile only (`unsafePushPending`) |
+
+Terminal (no auto-advance): `FAILED`, `BLOCKED`, `DONE`, `CANCELLED`, `CONFLICT`.  
+Human-gated: `READY_FOR_HUMAN_MERGE`, `HUMAN_REVIEW_REQUIRED`.
+
 ```text
 ai-auto
   → ai-working
