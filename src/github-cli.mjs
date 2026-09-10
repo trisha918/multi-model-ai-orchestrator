@@ -12,7 +12,7 @@ import { formatGithubStatus } from './github-pr.mjs';
 import { classifyCheckRuns, CI_STATUS, fetchGithubCiRuns } from './github-ci.mjs';
 import { runTask } from './orchestrator.mjs';
 import { git } from './workspace.mjs';
-import { collectGithubDoctor, formatGithubDoctor } from './github-doctor.mjs';
+import { collectGithubDoctor, formatGithubDoctor, collectIssueDoctor, formatIssueDoctor } from './github-doctor.mjs';
 import { formatGithubRepoDoctor, probeGithubRepo } from './github-probe.mjs';
 import { detectGithubAuth } from './github-client.mjs';
 
@@ -64,7 +64,7 @@ export function githubHelpText() {
     '  ai-orchestrator github labels setup --repo owner/name [--dry-run]',
     '  ai-orchestrator github status --repo owner/name --issue 42',
     '  ai-orchestrator github authorize --repo owner/name --issue 42',
-    '  ai-orchestrator github doctor [--repo owner/name]',
+    '  ai-orchestrator github doctor [--repo owner/name] [--issue n]',
     '  ai-orchestrator github resume --repo owner/name --issue 42 [--dry-run]',
     '  ai-orchestrator github simulate --fixture path.json',
     '',
@@ -177,6 +177,28 @@ export async function cmdGithub(parsed, {
   const client = await clientFactory(env);
 
   if (parsed.subcommand === 'doctor') {
+    if (parsed.repo && parsed.issue) {
+      const issueNumber = Number(parsed.issue);
+      if (!Number.isInteger(issueNumber) || issueNumber < 1) {
+        stderr('--issue must be a positive integer');
+        return 2;
+      }
+      try {
+        const report = await collectIssueDoctor({
+          client,
+          repo: parsed.repo,
+          issueNumber,
+          env,
+          cwd,
+        });
+        stdout(formatIssueDoctor(report));
+        return report.problems.length ? 1 : 0;
+      } catch (e) {
+        const msg = client.redact ? client.redact(e instanceof Error ? e.message : String(e)) : String(e);
+        stderr(msg);
+        return 2;
+      }
+    }
     const base = await collectGithubDoctor({ env, cwd });
     stdout(formatGithubDoctor(base));
     if (!parsed.repo) return base.auth.ok ? 0 : 0;
