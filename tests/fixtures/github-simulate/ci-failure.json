@@ -1,0 +1,19 @@
+{
+  "scenario": "ci-failure",
+  "lifecycle": true,
+  "repo": "owner/app",
+  "issue": {
+    "number": 3,
+    "title": "Fix flaky CI assertion",
+    "body": "Make the Node tests check pass after one AI fix.",
+    "labels": ["ai-auto"]
+  },
+  "actor": { "login": "maintainer", "permission": "admin", "association": "OWNER" },
+  "config": {
+    "automation": { "enabled": true, "mode": "assisted", "max_fix_attempts": 5 },
+    "review": { "required": false },
+    "tests": { "required": true }
+  },
+  "ciSequence": ["FAIL", "PASS"],
+  "localTests": "PASS"
+}

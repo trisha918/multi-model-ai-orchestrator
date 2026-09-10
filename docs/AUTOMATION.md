@@ -39,19 +39,25 @@ Canonical allowed transitions live in `src/github-state.mjs` (`ALLOWED_TRANSITIO
 | From | To | Trigger |
 | --- | --- | --- |
 | IDLE | STARTED / WORKING | Trusted `ai-auto` start |
+| IDLE | WAITING_FOR_CI | Existing PR found at start; skip implementation |
 | IDLE | BLOCKED | Untrusted trigger actor |
 | IDLE | CONFLICT | Contradictory route/model labels |
-| STARTED / WORKING | IMPLEMENTING | First implementation round |
-| IMPLEMENTING | LOCAL_TESTS | Independent local tests PASS/SKIP |
-| IMPLEMENTING | FAILED | Local tests FAIL |
+| STARTED | WORKING / IMPLEMENTING / LOCAL_TESTS / WAITING_FOR_CI | Implementation begins, or skip-ahead when work already exists |
+| STARTED | FAILED / CANCELLED / BLOCKED | Local tests FAIL, `ai-stop`, or untrusted |
 | LOCAL_TESTS | WAITING_FOR_CI | Branch on remote + PR opened or reused |
+| LOCAL_TESTS | FAILED / HUMAN_REVIEW_REQUIRED / CANCELLED | Tests FAIL, unreconciled push crash, or `ai-stop` |
 | WAITING_FOR_CI | READY_FOR_HUMAN_MERGE | GitHub CI PASS |
 | WAITING_FOR_CI | FIXING | CI FAIL/TIMEOUT and attempts remain |
 | WAITING_FOR_CI | HUMAN_REVIEW_REQUIRED | Attempt limit, or CI PASS but required review/tests did not |
 | WAITING_FOR_CI | FAILED | Resume CI sync sees FAIL (no extra fix start) |
-| FIXING | WAITING_FOR_CI | Fix pushed (never force-push) |
 | READY_FOR_HUMAN_MERGE | DONE | Human merged / closed (never auto-merge) |
-| HUMAN_REVIEW_REQUIRED | WAITING_FOR_CI | Crash-recovery reconcile only (`unsafePushPending`) |
+| READY_FOR_HUMAN_MERGE | HUMAN_REVIEW_REQUIRED | CI PASS but required local tests or review did not |
+| HUMAN_REVIEW_REQUIRED | WAITING_FOR_CI / LOCAL_TESTS | Crash-recovery reconcile only (`unsafePushPending`) |
+| FAILED | _(none)_ | Terminal |
+| BLOCKED | _(none)_ | Terminal |
+| DONE | _(none)_ | Terminal |
+
+Impossible (rejected): `FAILED` / `BLOCKED` / `DONE` → any other stage; `READY_FOR_HUMAN_MERGE` → `STARTED` / `IMPLEMENTING` / `WAITING_FOR_CI`; `HUMAN_REVIEW_REQUIRED` → `IMPLEMENTING`; `IMPLEMENTING` → `STARTED` (resume must not rewind).
 
 Terminal (no auto-advance): `FAILED`, `BLOCKED`, `DONE`, `CANCELLED`, `CONFLICT`.  
 Human-gated: `READY_FOR_HUMAN_MERGE`, `HUMAN_REVIEW_REQUIRED`.
@@ -78,18 +84,28 @@ Contradictory status labels are removed when a new status is applied.
 ```mermaid
 stateDiagram-v2
   [*] --> Idle
-  Idle --> Working: trusted ai-auto
+  Idle --> Started: trusted ai-auto
+  Idle --> WaitingCI: existing PR
   Idle --> Blocked: untrusted ai-auto
-  Working --> WaitingCI: local tests PASS, PR opened
+  Started --> LocalTests: implementation PASS
+  Started --> Failed: local tests FAIL
+  LocalTests --> WaitingCI: push + PR
   WaitingCI --> Ready: GitHub CI PASS
+  WaitingCI --> Failed: resume CI FAIL
   WaitingCI --> Fixing: CI FAIL and attempts < 5
   Fixing --> WaitingCI: fix pushed
   WaitingCI --> HumanReview: 5th CI FAIL or TIMEOUT at limit
-  Working --> Cancelled: ai-stop
-  Ready --> [*]: human merge
+  Ready --> Done: human merge
+  Ready --> HumanReview: required local/review missing
+  HumanReview --> WaitingCI: crash reconcile
+  Failed --> [*]
+  Blocked --> [*]
+  Done --> [*]
 ```
 
 State files live under `%LOCALAPPDATA%\MultiModelAIOrchestrator\github-automation\` (no credentials).
+
+Offline lifecycle (no GitHub network): `ai-orchestrator github simulate --fixture tests/fixtures/github-simulate/<scenario>.json` drives the real state machine with an in-memory GitHub/git/CI client. v1.1 still stops at ready-for-human-merge.
 
 ## First live test
 

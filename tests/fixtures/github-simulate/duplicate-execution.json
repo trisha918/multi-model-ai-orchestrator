@@ -1,0 +1,20 @@
+{
+  "scenario": "duplicate-execution",
+  "lifecycle": true,
+  "repo": "owner/app",
+  "issue": {
+    "number": 5,
+    "title": "Idempotent second automation run",
+    "body": "A second run must not implement, push, or open another PR.",
+    "labels": ["ai-auto"]
+  },
+  "actor": { "login": "maintainer", "permission": "admin", "association": "OWNER" },
+  "config": {
+    "automation": { "enabled": true, "mode": "assisted", "max_fix_attempts": 5 },
+    "review": { "required": false },
+    "tests": { "required": true }
+  },
+  "ci": "PASS",
+  "localTests": "PASS",
+  "duplicateRun": true
+}

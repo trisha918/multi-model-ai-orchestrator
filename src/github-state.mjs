@@ -112,6 +112,27 @@ export const HUMAN_GATED_STAGES = Object.freeze(['READY_FOR_HUMAN_MERGE', 'HUMAN
 export const COMPLETE_STAGES = Object.freeze(['READY_FOR_HUMAN_MERGE', 'DONE']);
 export const STOPPED_STAGES = Object.freeze(['HUMAN_REVIEW_REQUIRED', 'CANCELLED', 'FAILED', 'BLOCKED', 'CONFLICT']);
 
+/** Stages called out by the v1.1 state-machine audit. */
+export const AUDIT_STAGES = Object.freeze([
+  'STARTED',
+  'LOCAL_TESTS',
+  'WAITING_FOR_CI',
+  'READY_FOR_HUMAN_MERGE',
+  'HUMAN_REVIEW_REQUIRED',
+  'FAILED',
+  'BLOCKED',
+  'DONE',
+]);
+
+/** Canonical outbound edges for AUDIT_STAGES (same arrays as ALLOWED_TRANSITIONS). */
+export const AUDIT_STAGE_TRANSITIONS = Object.freeze(
+  Object.fromEntries(AUDIT_STAGES.map(stage => [stage, ALLOWED_TRANSITIONS[stage]])),
+);
+
+export function transitionsFrom(stage) {
+  return [...(ALLOWED_TRANSITIONS[stage] || [])];
+}
+
 export class IllegalStageTransitionError extends Error {
   constructor(from, to) {
     super(`Illegal GitHub automation transition: ${from} → ${to}`);

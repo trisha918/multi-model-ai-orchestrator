@@ -1,0 +1,37 @@
+{
+  "scenario": "existing-pr",
+  "lifecycle": true,
+  "repo": "owner/app",
+  "issue": {
+    "number": 4,
+    "title": "Resume with an existing pull request",
+    "body": "Do not implement or open another PR.",
+    "labels": ["ai-auto"]
+  },
+  "actor": { "login": "maintainer", "permission": "admin", "association": "OWNER" },
+  "config": {
+    "automation": { "enabled": true, "mode": "assisted", "max_fix_attempts": 5 },
+    "review": { "required": false },
+    "tests": { "required": true }
+  },
+  "ci": "PASS",
+  "localTests": "PASS",
+  "branch": "ai/issue-4-resume-with-an-existing-pull-request",
+  "implementationCommit": "2d1d7a07bb537b06f07f1afa8aea2b580064a09f",
+  "existingPr": {
+    "number": 44,
+    "head": {
+      "ref": "ai/issue-4-resume-with-an-existing-pull-request",
+      "sha": "2d1d7a07bb537b06f07f1afa8aea2b580064a09f"
+    }
+  },
+  "existingState": {
+    "stage": "WORKING",
+    "localTests": "PASS",
+    "review": "PASS",
+    "commitSha": "2d1d7a07bb537b06f07f1afa8aea2b580064a09f",
+    "branch": "ai/issue-4-resume-with-an-existing-pull-request",
+    "prNumber": null,
+    "mode": "assisted"
+  }
+}

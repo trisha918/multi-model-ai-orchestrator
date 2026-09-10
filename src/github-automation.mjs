@@ -22,7 +22,7 @@ import {
 import { runtimeDirs } from './paths.mjs';
 
 export { CI_STATUS };
-export { isAllowedTransition, transitionStage, applyStage, ALLOWED_TRANSITIONS } from './github-state.mjs';
+export { isAllowedTransition, transitionStage, applyStage, ALLOWED_TRANSITIONS, AUDIT_STAGES, AUDIT_STAGE_TRANSITIONS, transitionsFrom } from './github-state.mjs';
 
 export function recordCiResult(state, status) {
   if (isSettledStage(state?.stage)) {
@@ -144,8 +144,8 @@ function applyImplementationResult(state, result, config) {
   state.branchPushed = false;
 }
 
-export async function shouldSkipGitPush({ client, owner, name, state } = {}) {
-  if (state?.prNumber) return { skip: true, reason: 'pr-exists' };
+export async function shouldSkipGitPush({ client, owner, name, state, ignoreExistingPr = false } = {}) {
+  if (state?.prNumber && !ignoreExistingPr) return { skip: true, reason: 'pr-exists' };
   if (state?.branchPushed && state.commitSha && !state.unsafePushPending) {
     return { skip: true, reason: 'branch-already-pushed' };
   }
@@ -706,7 +706,7 @@ export async function runIssueAutomation({
           break;
         }
         assertSafePushBranch(state.branch);
-        const fixSkip = await shouldSkipGitPush({ client, owner, name, state });
+        const fixSkip = await shouldSkipGitPush({ client, owner, name, state, ignoreExistingPr: true });
         if (fixSkip.skip) {
           state.branchPushed = true;
           state.unsafePushPending = false;

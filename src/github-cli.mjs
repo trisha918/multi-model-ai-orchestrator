@@ -6,7 +6,8 @@ import { createGithubClient } from './github-client.mjs';
 import { loadRepoAutomationConfig, DEFAULT_REPO_AUTOMATION } from './github-config.mjs';
 import { LABEL_DEFINITIONS } from './github-labels.mjs';
 import { parseRepoSlug } from './github-state.mjs';
-import { inspectIssueAutomation, runIssueAutomation, simulateGithubAutomation, implementationArgv, resumeIssueAutomation } from './github-automation.mjs';
+import { inspectIssueAutomation, runIssueAutomation, implementationArgv, resumeIssueAutomation } from './github-automation.mjs';
+import { runGithubLifecycleSimulator, formatSimulateResult } from './github-simulate.mjs';
 import { formatGithubStatus } from './github-pr.mjs';
 import { classifyCheckRuns, CI_STATUS, fetchGithubCiRuns } from './github-ci.mjs';
 import { runTask } from './orchestrator.mjs';
@@ -168,8 +169,8 @@ export async function cmdGithub(parsed, {
       return 2;
     }
     const raw = JSON.parse(await readFile(parsed.fixture, 'utf8'));
-    const result = await simulateGithubAutomation(raw);
-    stdout(JSON.stringify({ stage: result.state.stage, attempt: result.state.attempt, max: result.state.maxAttempts, ok: result.ok }, null, 2));
+    const result = await runGithubLifecycleSimulator(raw, { env });
+    stdout(formatSimulateResult(result));
     return result.ok ? 0 : 1;
   }
 
