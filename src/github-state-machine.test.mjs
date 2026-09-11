@@ -258,7 +258,8 @@ test('crash after LOCAL_TESTS persist resumes without losing commit or re-implem
   }
 });
 
-test('UNKNOWN optional review after LOCAL_TESTS does not re-run implementation', async () => {
+test('original bug: optional UNKNOWN review on LOCAL_TESTS resume skips implementation', async () => {
+  assert.equal(assisted.review.required, false);
   const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-unknown-review-'));
   const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
   const implCommit = 'dddddddddddddddddddddddddddddddddddddddd';
@@ -280,9 +281,15 @@ test('UNKNOWN optional review after LOCAL_TESTS does not re-run implementation',
       prNumber: null,
       mode: 'assisted',
     }, env);
+    const loaded = await loadIssueState('owner/app', 42, env);
+    assert.equal(loaded.stage, 'LOCAL_TESTS');
+    assert.equal(loaded.localTests, 'PASS');
+    assert.equal(loaded.review, 'UNKNOWN');
+    assert.equal(loaded.branch, implBranch);
+    assert.equal(loaded.commitSha, implCommit);
     assert.equal(
       shouldSkipImplementationOnResume({
-        state: await loadIssueState('owner/app', 42, env),
+        state: loaded,
         config: assisted,
         decision: { action: 'resume' },
       }),
@@ -296,7 +303,7 @@ test('UNKNOWN optional review after LOCAL_TESTS does not re-run implementation',
       env,
       runImplementation: async () => {
         implCalls += 1;
-        throw new Error('UNKNOWN optional review must not re-implement');
+        throw new Error('optional UNKNOWN review must not re-implement');
       },
       gitPush: async ({ branch }) => {
         pushCalls += 1;
@@ -307,9 +314,9 @@ test('UNKNOWN optional review after LOCAL_TESTS does not re-run implementation',
     });
     assert.equal(implCalls, 0);
     assert.equal(pushCalls, 1);
-    assert.equal(result.state.stage, 'READY_FOR_HUMAN_MERGE');
     assert.equal(result.state.review, 'SKIP');
     assert.equal(result.state.commitSha, implCommit);
+    assert.equal(result.state.stage, 'READY_FOR_HUMAN_MERGE');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
