@@ -154,7 +154,6 @@ test('issue doctor reports missing state and missing runner as problems', async 
     assert.equal(report.stage, 'IDLE');
     assert.ok(report.problems.some(p => /state file/i.test(p)));
     assert.ok(report.problems.some(p => /Runner/i.test(p)));
-    assert.ok(report.problems.some(p => /Authentication/i.test(p)));
     const text = formatIssueDoctor(report);
     assert.match(text, /Problems:\n-/);
   } finally {

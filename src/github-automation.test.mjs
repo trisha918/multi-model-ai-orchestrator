@@ -560,6 +560,7 @@ test('resume from LOCAL_TESTS pushes and opens PR without re-implementing', asyn
       }),
       stage: 'LOCAL_TESTS',
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: implCommit,
       branch: implBranch,
       prNumber: null,
@@ -642,6 +643,7 @@ test('unsafePushPending with matching remote SHA continues without pushing', asy
       stage: 'HUMAN_REVIEW_REQUIRED',
       unsafePushPending: true,
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: implCommit,
       branch: implBranch,
       prNumber: null,
@@ -703,6 +705,7 @@ test('unsafePushPending with missing remote branch stays HUMAN_REVIEW_REQUIRED',
       stage: 'HUMAN_REVIEW_REQUIRED',
       unsafePushPending: true,
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: implCommit,
       branch: implBranch,
       prNumber: null,
@@ -750,6 +753,7 @@ test('unsafePushPending with remote SHA mismatch stays HUMAN_REVIEW_REQUIRED', a
       stage: 'HUMAN_REVIEW_REQUIRED',
       unsafePushPending: true,
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: implCommit,
       branch: implBranch,
       prNumber: null,
@@ -799,6 +803,7 @@ test('unsafePushPending matching remote reuses existing PR and does not duplicat
       stage: 'HUMAN_REVIEW_REQUIRED',
       unsafePushPending: true,
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: implCommit,
       branch: implBranch,
       prNumber: null,
@@ -878,6 +883,7 @@ test('WAITING_FOR_CI with successful checks becomes READY_FOR_HUMAN_MERGE', asyn
       prNumber: 7,
       githubCi: 'UNKNOWN',
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: commit,
       branch,
       mode: 'assisted',
@@ -914,7 +920,7 @@ test('WAITING_FOR_CI with successful checks becomes READY_FOR_HUMAN_MERGE', asyn
   }
 });
 
-test('WAITING_FOR_CI with failed checks becomes FAILED', async () => {
+test('WAITING_FOR_CI with failed checks resumes bounded fixing', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
   const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
   const commit = '2d1d7a07bb537b06f07f1afa8aea2b580064a09f';
@@ -939,6 +945,7 @@ test('WAITING_FOR_CI with failed checks becomes FAILED', async () => {
       prNumber: 7,
       githubCi: 'UNKNOWN',
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: commit,
       branch,
       mode: 'assisted',
@@ -951,18 +958,18 @@ test('WAITING_FOR_CI with failed checks becomes FAILED', async () => {
       env,
       runImplementation: async () => {
         implCalls += 1;
-        throw new Error('must not re-implement on CI fail sync');
+        return { ok: true, tests: 'PASS', review: 'PASS', commit, branch };
       },
       gitPush: async () => {
         pushCalls += 1;
-        throw new Error('must not push on CI fail sync');
+        return { sha: commit };
       },
     });
-    assert.equal(implCalls, 0);
-    assert.equal(pushCalls, 0);
+    assert.equal(implCalls, 4);
+    assert.equal(pushCalls, 4);
     assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 0);
     assert.equal(result.state.githubCi, 'FAIL');
-    assert.equal(result.state.stage, 'FAILED');
+    assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
     assert.equal(result.code, 1);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -994,6 +1001,7 @@ test('WAITING_FOR_CI with pending checks stays WAITING_FOR_CI', async () => {
       prNumber: 7,
       githubCi: 'UNKNOWN',
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: commit,
       branch,
       mode: 'assisted',
@@ -1017,7 +1025,7 @@ test('WAITING_FOR_CI with pending checks stays WAITING_FOR_CI', async () => {
     assert.equal(pushCalls, 0);
     assert.equal(client.log.filter(x => x.op === 'createPullRequest').length, 0);
     assert.equal(result.state.stage, 'WAITING_FOR_CI');
-    assert.equal(result.state.githubCi, 'UNKNOWN');
+    assert.equal(result.state.githubCi, 'PENDING');
     assert.equal(result.state.prNumber, 7);
     assert.equal(result.waiting, true);
   } finally {
@@ -1109,6 +1117,7 @@ test('WAITING_FOR_CI resume with Node tests Check API envelope becomes READY_FOR
       prNumber: 7,
       githubCi: 'UNKNOWN',
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: commit,
       branch,
       mode: 'assisted',
@@ -1167,6 +1176,7 @@ test('WAITING_FOR_CI resume with disabled cwd config still becomes READY_FOR_HUM
       prNumber: 7,
       githubCi: 'UNKNOWN',
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: commit,
       branch,
       mode: 'assisted',

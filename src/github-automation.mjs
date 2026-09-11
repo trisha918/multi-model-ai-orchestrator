@@ -110,7 +110,7 @@ export function decideTrigger({
   return { action: 'start', reason: 'trusted ai-auto' };
 }
 
-export async function readGithubCiStatus({ client, owner, name, state }) {
+export async function readGithubCiStatus({ client, owner, name, state, config }) {
   let ref = state?.commitSha || state?.branch || '';
   if (state?.prNumber && typeof client.getPullRequest === 'function') {
     try {
@@ -123,12 +123,15 @@ export async function readGithubCiStatus({ client, owner, name, state }) {
   const runs = await fetchGithubCiRuns(client, owner, name, ref);
   const classified = classifyCheckRuns(runs, { now: Date.now() });
   if (classified.status === CI_STATUS.PASS) {
-    return { githubCi: 'PASS', stage: 'READY_FOR_HUMAN_MERGE', summary: classified.summary || '' };
+    if (!config) return { githubCi: 'PASS', stage: 'READY_FOR_HUMAN_MERGE', summary: classified.summary || '' };
+    const testsOk = config?.tests?.required ? state?.localTests === 'PASS' : ['PASS', 'SKIP'].includes(state?.localTests);
+    const reviewOk = config?.review?.required ? state?.review === 'PASS' : ['PASS', 'SKIP'].includes(state?.review);
+    return { githubCi: 'PASS', stage: testsOk && reviewOk ? 'READY_FOR_HUMAN_MERGE' : 'HUMAN_REVIEW_REQUIRED', summary: classified.summary || '' };
   }
   if (classified.status === CI_STATUS.FAIL) {
-    return { githubCi: 'FAIL', stage: 'FAILED', summary: classified.summary || '' };
+    return { githubCi: 'FAIL', stage: 'FIXING', summary: classified.summary || '' };
   }
-  return { githubCi: 'UNKNOWN', stage: 'WAITING_FOR_CI', summary: classified.summary || '' };
+  return { githubCi: 'PENDING', stage: 'WAITING_FOR_CI', summary: classified.summary || '' };
 }
 
 function dryLog(plan, message, extra = {}) {
@@ -474,7 +477,8 @@ export async function runIssueAutomation({
     const resumeLocalTests = skipGitPush || resumeWaitingForCi || (
       decision.action === 'resume'
       && state.stage === 'LOCAL_TESTS'
-      && (state.localTests === 'PASS' || state.localTests === 'SKIP')
+      && (config.tests.required ? state.localTests === 'PASS' : ['PASS', 'SKIP'].includes(state.localTests))
+      && (config.review.required ? state.review === 'PASS' : ['PASS', 'SKIP'].includes(state.review))
       && !state.prNumber
       && Boolean(state.branch && state.commitSha)
     );
@@ -550,7 +554,7 @@ export async function runIssueAutomation({
         env,
       });
       applyImplementationResult(state, result, config);
-      const failed = result.ok === false || (config.tests.required && result.tests === 'FAIL');
+      const failed = result?.ok !== true || (config.tests.required && result.tests !== 'PASS') || (config.review.required && result.review !== 'PASS');
       if (!failed) applyStage(state, 'LOCAL_TESTS');
       state = await saveIssueState(state, env);
       await emit('implementation_completed', failed ? 'FAIL' : 'PASS', state.stage);
@@ -590,7 +594,7 @@ export async function runIssueAutomation({
         state = await saveIssueState(state, env);
         await emit('push_started', state.branch, state.stage);
         try {
-          const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
+          const pushed = await gitPush({ branch: state.branch, repo: localRepo, repository: state.repository, expectedSha: state.commitSha, force: false });
           rememberPushedSha(state, pushed);
           state.unsafePushPending = false;
           state.branchPushed = true;
@@ -634,6 +638,18 @@ export async function runIssueAutomation({
       return { crashed: false };
     }
 
+    const resumeMissingRequiredGate = decision.action === 'resume'
+      && state.stage === 'LOCAL_TESTS'
+      && ((!config.tests.required || state.localTests === 'PASS') === false || (!config.review.required || state.review === 'PASS') === false);
+    if (resumeMissingRequiredGate) {
+      applyStage(state, 'HUMAN_REVIEW_REQUIRED');
+      state.lastDiagnosis = 'Required local tests or AI review did not pass';
+      state = await saveIssueState(state, env);
+      await emit('human_review_required', state.lastDiagnosis, state.stage);
+      await applyLabels(client, { owner, name, issueNumber, issue, stage: state.stage, dryRun, plan });
+      return done({ code: 1, plan, state, decision });
+    }
+
     if (!skipImplementation) {
       const first = await implementRound();
       if (first.stopped) {
@@ -650,7 +666,18 @@ export async function runIssueAutomation({
       }
     }
 
-    if (!state.prNumber && (state.localTests === 'PASS' || state.localTests === 'SKIP')) {
+    const requiredTestsOk = !config.tests.required || state.localTests === 'PASS';
+    const requiredReviewOk = !config.review.required || state.review === 'PASS';
+    if (!requiredTestsOk || !requiredReviewOk) {
+      applyStage(state, 'HUMAN_REVIEW_REQUIRED');
+      state.lastDiagnosis = 'Required local tests or AI review did not pass';
+      state = await saveIssueState(state, env);
+      await emit('human_review_required', state.lastDiagnosis, state.stage);
+      await applyLabels(client, { owner, name, issueNumber, issue, stage: state.stage, dryRun, plan });
+      return done({ code: 1, plan, state, decision });
+    }
+
+    if (!state.prNumber && (state.localTests === 'PASS' || (!config.tests.required && state.localTests === 'SKIP'))) {
       const pushed = await pushBranchAndOpenPr({ skipGitPush });
       if (pushed.crashed) {
         return done({ code: 1, crashed: true, plan, state });
@@ -658,10 +685,14 @@ export async function runIssueAutomation({
     }
     if (resumeWaitingForCi) {
       await emit('ci_started', state.commitSha || state.branch, state.stage);
-      const sync = await readGithubCiStatus({ client, owner, name, state });
-      state.githubCi = sync.githubCi;
-      applyStage(state, sync.stage);
-      if (sync.githubCi === 'FAIL') state.lastFailure = sync.summary || 'GitHub CI failed';
+      const sync = await readGithubCiStatus({ client, owner, name, state, config });
+      if (sync.githubCi === 'FAIL') {
+        state = recordCiResult(state, CI_STATUS.FAIL);
+        state.lastFailure = sync.summary || 'GitHub CI failed';
+      } else {
+        state.githubCi = sync.githubCi;
+        applyStage(state, sync.stage);
+      }
       if (sync.githubCi === 'PASS') {
         state.lastFailure = '';
         state.pullRequestAutoMerged = false;
@@ -687,13 +718,15 @@ export async function runIssueAutomation({
         });
         state = await saveIssueState(state, env);
       }
-      return done({
-        code: state.stage === 'FAILED' ? 1 : 0,
-        plan,
-        state,
-        decision,
-        waiting: state.stage === 'WAITING_FOR_CI',
-      });
+      if (state.stage !== 'FIXING') {
+        return done({
+          code: state.stage === 'READY_FOR_HUMAN_MERGE' ? 0 : 1,
+          plan,
+          state,
+          decision,
+          waiting: state.stage === 'WAITING_FOR_CI',
+        });
+      }
     }
 
     if (state.stage !== 'FIXING') applyStage(state, 'WAITING_FOR_CI');
@@ -756,7 +789,7 @@ export async function runIssueAutomation({
           state = await saveIssueState(state, env);
           await emit('push_started', state.branch, state.stage);
           try {
-            const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
+            const pushed = await gitPush({ branch: state.branch, repo: localRepo, repository: state.repository, expectedSha: state.commitSha, force: false });
             rememberPushedSha(state, pushed);
             state.unsafePushPending = false;
             state.branchPushed = true;
@@ -808,8 +841,8 @@ export async function runIssueAutomation({
         }
       }
       if (state.stage === 'READY_FOR_HUMAN_MERGE') {
-        const reviewOk = !config.review.required || state.review === 'PASS' || state.review === 'SKIP';
-        const testsOk = !config.tests.required || state.localTests === 'PASS' || state.localTests === 'SKIP';
+        const reviewOk = !config.review.required || state.review === 'PASS';
+        const testsOk = !config.tests.required || state.localTests === 'PASS';
         if (!reviewOk || !testsOk) {
           applyStage(state, 'HUMAN_REVIEW_REQUIRED');
           state.lastDiagnosis = 'GitHub CI passed but required local tests or AI review did not pass';

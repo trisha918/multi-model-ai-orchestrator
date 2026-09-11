@@ -1,4 +1,5 @@
-import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { validateImplementationOutput } from './run-controls.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { runProcess, findOnPath } from './tooling.mjs';
@@ -11,7 +12,7 @@ import { runGithubLifecycleSimulator, formatSimulateResult } from './github-simu
 import { formatGithubStatus } from './github-pr.mjs';
 import { classifyCheckRuns, CI_STATUS, fetchGithubCiRuns } from './github-ci.mjs';
 import { runTask } from './orchestrator.mjs';
-import { git } from './workspace.mjs';
+import { git, resolveGitRootFromCwd } from './workspace.mjs';
 import { collectGithubDoctor, formatGithubDoctor, collectIssueDoctor, formatIssueDoctor } from './github-doctor.mjs';
 import { formatGithubRepoDoctor, probeGithubRepo } from './github-probe.mjs';
 import { detectGithubAuth } from './github-client.mjs';
@@ -94,45 +95,48 @@ export async function defaultRunImplementation({
   task,
   routing,
   env,
+  state,
   runTaskImpl = runTask,
   gitImpl = git,
 } = {}) {
+  if (state?.repository) await verifyGithubCheckout(repo, state.repository);
   const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-task-'));
   try {
     const taskFile = path.join(dir, 'task.txt');
     await writeFile(taskFile, task, { encoding: 'utf8' });
     const argv = implementationArgv({ repo, branch, taskFile, routing });
-    const code = await runTaskImpl(argv, { env });
-    const numeric = code === 0 ? 0 : (Number.isInteger(code) ? code : 1);
-    let hash = '';
-    try {
-      hash = await gitImpl(repo, ['rev-parse', branch]);
-    } catch {
-      hash = '';
-    }
-    return {
-      ok: numeric === 0,
-      tests: numeric === 0 ? 'PASS' : 'FAIL',
-      review: 'PASS',
-      commit: hash,
-      branch,
-      route: routing.worker,
-      model: routing.model,
-    };
+    let result;
+    const code = await runTaskImpl(argv, { env, resume: { expectedSha: state?.commitSha }, onResult: value => { result = value; } });
+    if (code !== 0 || !result) return { ...result, ok: false, tests: result?.tests || 'UNKNOWN', review: result?.review || 'UNKNOWN', error: 'Implementation did not supply a successful structured result' };
+    const sha = await gitImpl(repo, ['rev-parse', branch]);
+    validateImplementationOutput(result, { branch, sha, testsRequired: false, reviewRequired: false });
+    return result;
   } finally {
-    await cleanupOwnedTempDir(dir);
+    await rm(dir, { recursive: true, force: true });
   }
 }
 
-export async function defaultGitPush({ branch, repo }) {
+export async function verifyGithubCheckout(repo, slug) {
+  const root = await resolveGitRootFromCwd(repo);
+  const remote = await git(root, ['remote', 'get-url', 'origin']);
+  const parsed = remote.replace(/^git@github\.com:/i, '').replace(/^https:\/\/github\.com\//i, '').replace(/\.git$/, '');
+  if (parsed.toLowerCase() !== slug.toLowerCase()) throw new Error('Local origin does not match --repo. Run this command from the target repository checkout.');
+  return root;
+}
+
+export async function defaultGitPush({ branch, repo, expectedSha, repository }) {
   if (!repo) throw new Error('Missing local repository for git push');
-  await git(repo, ['push', '-u', 'origin', branch]);
+  await verifyGithubCheckout(repo, repository);
+  const before = await git(repo, ['rev-parse', `refs/heads/${branch}`]);
+  if (!expectedSha || before !== expectedSha) throw new Error('Branch changed after verification; refusing push');
+  await git(repo, ['push', '-u', 'origin', `refs/heads/${branch}:refs/heads/${branch}`]);
   const sha = await git(repo, ['rev-parse', branch]);
   return { sha };
 }
 
-export async function waitForGithubCi({ client, owner, name, ref, timeoutMs = 60 * 60 * 1000 }) {
-  const started = Date.now();
+export async function waitForGithubCi({ client, owner, name, ref, timeoutMs = 60 * 60 * 1000, startedAt }) {
+  const parsedStart = Date.parse(startedAt || '');
+  const started = Number.isFinite(parsedStart) ? parsedStart : Date.now();
   while (Date.now() - started < timeoutMs) {
     const runs = await fetchGithubCiRuns(client, owner, name, ref);
     const classified = classifyCheckRuns(runs, { now: Date.now(), timeoutMs, startedAt: new Date(started).toISOString() });
@@ -277,6 +281,22 @@ export async function cmdGithub(parsed, {
   }
 
   if (parsed.subcommand === 'issue run' || parsed.subcommand === 'resume') {
+    let localRoot = cwd;
+    let defaultBranch = 'main';
+    if (clientFactory === buildLiveClient && !parsed.dryRun) {
+      localRoot = await verifyGithubCheckout(cwd, slug);
+      const remoteRepo = await client.getRepo(owner, name);
+      defaultBranch = remoteRepo.default_branch;
+      if (!defaultBranch) throw new Error('Cannot determine repository default branch');
+      const { loadIssueState } = await import('./github-state.mjs');
+      const existing = await loadIssueState(slug, issueNumber, env);
+      if (!existing) {
+        await git(localRoot, ['fetch', 'origin', defaultBranch]);
+        const head = await git(localRoot, ['rev-parse', 'HEAD']);
+        const base = await git(localRoot, ['rev-parse', `refs/remotes/origin/${defaultBranch}`]);
+        if (head !== base) throw new Error('Checkout must match origin default branch before starting a new Issue run. Update it and retry.');
+      }
+    }
     const fn = parsed.subcommand === 'resume' ? resumeIssueAutomation : runIssueAutomation;
     const result = await fn({
       client,
@@ -285,12 +305,13 @@ export async function cmdGithub(parsed, {
       issueNumber,
       dryRun: parsed.dryRun,
       env,
-      localRepo: cwd,
+      localRepo: localRoot,
+      defaultBranch,
       runImplementation: parsed.dryRun ? async () => ({ ok: true, tests: 'PASS', review: 'PASS', commit: '', branch: 'dry' }) : runImplementation,
       gitPush: parsed.dryRun ? async () => ({ sha: '' }) : gitPush,
       waitForCi: parsed.dryRun
         ? async () => ({ status: CI_STATUS.PASS, summary: 'dry-run' })
-        : (waitForCi || (async ({ ref }) => waitForGithubCi({ client, owner, name, ref }))),
+        : (waitForCi || (async ({ ref, state }) => waitForGithubCi({ client, owner, name, ref, startedAt: state.ciStartedAt }))),
     });
     if (result.dryRun) {
       stdout('Dry run — no push, PR, comment, or label writes.');

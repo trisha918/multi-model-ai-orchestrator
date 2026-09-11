@@ -167,20 +167,11 @@ test('PowerShell variable → UTF-8 task file → Node CLI is lossless', async (
 
 test('runTask print hook records exact task without workers', async () => {
   let printed = '';
-  const origWrite = process.stdout.write;
-  process.stdout.write = (chunk, ...rest) => {
-    printed += chunk.toString();
-    return true;
-  };
-  try {
-    const code = await runTask(['--task', EXACT_PERSIAN_TASK, '--repo', os.tmpdir()], {
-      printTaskAndExit: true,
-    });
-    assert.equal(code, 0);
-    assert.equal(printed, EXACT_PERSIAN_TASK);
-  } finally {
-    process.stdout.write = origWrite;
-  }
+  const code = await runTask(['--task', EXACT_PERSIAN_TASK, '--repo', os.tmpdir()], {
+    printTaskAndExit: true, stdout: { write: text => { printed += text; } },
+  });
+  assert.equal(code, 0);
+  assert.equal(printed, EXACT_PERSIAN_TASK);
 });
 
 void resolveTool;

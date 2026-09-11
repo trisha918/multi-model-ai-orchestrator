@@ -3,6 +3,13 @@ import { LABEL_DEFINITIONS } from './github-labels.mjs';
 
 const API = 'https://api.github.com';
 
+export function isPullForIssue(pr, issueNumber) {
+  if (pr.state && pr.state !== 'open') return false;
+  const branch = typeof pr.head === 'string' ? pr.head : pr.head?.ref;
+  return Boolean(branch?.startsWith(`ai/issue-${Number(issueNumber)}-`))
+    && new RegExp(`(?:Closes|Fixes|Resolves) #${Number(issueNumber)}(?:\\s|$)`, 'i').test(String(pr.body || ''));
+}
+
 export function redactGithubText(text) {
   return redactCiText(text)
     .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
@@ -54,6 +61,19 @@ export function createGithubClient({
   const token = headerToken(env);
   const auth = detectGithubAuth(env, { ghResolved: ghPath });
 
+  async function pages(apiPath, field) {
+    const items = [];
+    for (let page = 1; page <= 100; page++) {
+      const separator = apiPath.includes('?') ? '&' : '?';
+      const payload = await request('GET', `${apiPath}${separator}per_page=100&page=${page}`);
+      const batch = field ? payload[field] : payload;
+      if (!Array.isArray(batch)) throw new Error(`Unexpected GitHub list response: ${apiPath}`);
+      items.push(...batch);
+      if (batch.length < 100) return items;
+    }
+    throw new Error('GitHub pagination safety limit reached; refusing partial results');
+  }
+
   async function request(method, apiPath, body) {
     if (typeof fetchImpl !== 'function') {
       throw new Error('GitHub HTTP client is unavailable.');
@@ -80,6 +100,7 @@ export function createGithubClient({
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     const res = await fetchImpl(`${API}${apiPath}`, {
       method,
+      signal: AbortSignal.timeout(60_000),
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -144,15 +165,14 @@ export function createGithubClient({
       return request('GET', `/repos/${owner}/${name}/issues/${number}/comments?per_page=50`);
     },
     async getIssueEvents(owner, name, number) {
-      return request('GET', `/repos/${owner}/${name}/issues/${number}/events?per_page=100`);
+      return pages(`/repos/${owner}/${name}/issues/${number}/events`);
     },
     async getCollaboratorPermission(owner, name, username) {
       return request('GET', `/repos/${owner}/${name}/collaborators/${encodeURIComponent(username)}/permission`);
     },
     async listPullsForIssue(owner, name, issueNumber) {
-      const q = encodeURIComponent(`repo:${owner}/${name} is:pr ${issueNumber}`);
-      const data = await request('GET', `/search/issues?q=${q}`);
-      return data.items || [];
+      const pulls = await this.listPulls(owner, name, { state: 'open' });
+      return pulls.filter(p => isPullForIssue(p, issueNumber));
     },
     async createPullRequest(owner, name, { title, body, head, base }) {
       return request('POST', `/repos/${owner}/${name}/pulls`, { title, body, head, base });
@@ -170,12 +190,13 @@ export function createGithubClient({
       }
     },
     async listPulls(owner, name, { head, state: prState = 'open' } = {}) {
-      const params = new URLSearchParams({ state: prState, per_page: '30' });
+      const params = new URLSearchParams({ state: prState });
       if (head) params.set('head', head.includes(':') ? head : `${owner}:${head}`);
-      return request('GET', `/repos/${owner}/${name}/pulls?${params}`);
+      return pages(`/repos/${owner}/${name}/pulls?${params}`);
     },
     async getChecks(owner, name, ref) {
-      return request('GET', `/repos/${owner}/${name}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`);
+      const check_runs = await pages(`/repos/${owner}/${name}/commits/${encodeURIComponent(ref)}/check-runs`, 'check_runs');
+      return { total_count: check_runs.length, check_runs };
     },
     async listWorkflowRuns(owner, name, { headSha } = {}) {
       const params = new URLSearchParams({ per_page: '20' });
@@ -183,7 +204,10 @@ export function createGithubClient({
       return request('GET', `/repos/${owner}/${name}/actions/runs?${params}`);
     },
     async getCombinedStatus(owner, name, ref) {
-      return request('GET', `/repos/${owner}/${name}/commits/${encodeURIComponent(ref)}/status`);
+      const all = await pages(`/repos/${owner}/${name}/commits/${encodeURIComponent(ref)}/status`, 'statuses');
+      const latest = new Map();
+      for (const status of all) if (!latest.has(status.context)) latest.set(status.context, status);
+      return { statuses: [...latest.values()] };
     },
     async getWorkflowRun(owner, name, runId) {
       return request('GET', `/repos/${owner}/${name}/actions/runs/${runId}`);
@@ -196,7 +220,7 @@ export function createGithubClient({
       }
     },
     async listBranches(owner, name) {
-      return request('GET', `/repos/${owner}/${name}/branches?per_page=100`);
+      return pages(`/repos/${owner}/${name}/branches`);
     },
     async listRunners(owner, name) {
       return request('GET', `/repos/${owner}/${name}/actions/runners?per_page=100`);
@@ -290,7 +314,7 @@ export function createMemoryGithubClient(seed = {}) {
       return permissions[username] || { permission: 'none', user: { login: username } };
     },
     async listPullsForIssue(owner, name, issueNumber) {
-      return pulls.filter(p => p.issueNumber === issueNumber || String(p.body || '').includes(`#${issueNumber}`));
+      return pulls.filter(p => isPullForIssue(p, issueNumber));
     },
     async createPullRequest(owner, name, payload) {
       log.push({ op: 'createPullRequest', ...payload });

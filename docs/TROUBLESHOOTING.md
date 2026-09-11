@@ -1,5 +1,7 @@
 # Troubleshooting
 
+For retained worktrees, interrupted local queue jobs, locks, missing result records, SKIP test outcomes and unknown billing, see [local module troubleshooting and crash recovery](LOCAL-MODULES.md#crash-recovery). Locks are not automatically stolen after a fixed age. Inspect and stop their owner before removing an exact lock file; never delete the whole runtime directory as a shortcut.
+
 ## Runner offline
 
 `ai-issue.yml` AI job uses `runs-on: [self-hosted, Windows, ai-orchestrator]`. If no runner with those labels is idle, the job queues. Register a runner on a Windows machine that already has the AI CLIs. Do not silently install a runner with leaked tokens.

@@ -1,7 +1,8 @@
-import { existsSync, realpathSync, statSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { existsSync, realpathSync, statSync, createReadStream } from 'node:fs';
+import { mkdir, lstat, readlink } from 'node:fs/promises';
 import path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
+import { readJson } from './local-store.mjs';
 import { isWin, runTool } from './tooling.mjs';
 import { runtimeDirs } from './paths.mjs';
 
@@ -11,10 +12,20 @@ const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
 
 export function canonicalPath(input) {
   const resolved = path.resolve(String(input || ''));
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return resolved;
+  let existing = resolved;
+  const suffix = [];
+  for (;;) {
+    try {
+      // Native realpath expands Windows 8.3 aliases (e.g. RUNNER~1).
+      // Resolve the nearest existing ancestor when allocating a new worktree.
+      return path.join(realpathSync.native(existing), ...suffix);
+    } catch (error) {
+      if (error.code !== 'ENOENT') return resolved;
+      const parent = path.dirname(existing);
+      if (parent === existing) return resolved;
+      suffix.unshift(path.basename(existing));
+      existing = parent;
+    }
   }
 }
 
@@ -114,12 +125,28 @@ export async function gitState(repo) {
   const status = await runTool('git', ['status', '--short'], { cwd: repo, timeoutMs: 60_000, quiet: true });
   const unstaged = await runTool('git', ['diff', '--', '.'], { cwd: repo, timeoutMs: 60_000, quiet: true });
   const staged = await runTool('git', ['diff', '--cached', '--', '.'], { cwd: repo, timeoutMs: 60_000, quiet: true });
+  for (const r of [status, unstaged, staged]) {
+    if (r.code !== 0) throw new Error(`Unable to inspect worktree: ${r.stderr || r.stdout}`);
+  }
+  const untrackedFiles = (await git(repo, ['ls-files', '--others', '--exclude-standard', '-z'])).split('\0').filter(Boolean);
+  const untracked = [];
+  for (const name of untrackedFiles) {
+    const file = path.join(repo, name);
+    const info = await lstat(file);
+    const digest = createHash('sha256');
+    if (info.isSymbolicLink()) digest.update(await readlink(file));
+    else if (info.isFile()) for await (const chunk of createReadStream(file)) digest.update(chunk);
+    else throw new Error(`Cannot safely fingerprint untracked file: ${name}`);
+    untracked.push({ name, sha256: digest.digest('hex') });
+  }
   return {
     status: status.stdout,
+    untracked,
     diff: [
       '### git status --short', status.stdout || '(clean)',
       '\n### git diff', unstaged.stdout || '(none)',
       '\n### git diff --cached', staged.stdout || '(none)',
+      '\n### untracked file fingerprints', JSON.stringify(untracked),
     ].join('\n'),
     patch: (unstaged.stdout || '') + (staged.stdout || ''),
   };
@@ -152,7 +179,7 @@ async function branchExists(repo, branch) {
   return any.code === 0;
 }
 
-export async function createIsolatedWorktree(sourceRepo, task, requestedBranch, preferredRunId = '', env = process.env) {
+export async function createIsolatedWorktree(sourceRepo, task, requestedBranch, preferredRunId = '', env = process.env, resume = {}) {
   const dirs = runtimeDirs(env);
   await mkdir(dirs.worktrees, { recursive: true });
 
@@ -175,6 +202,23 @@ export async function createIsolatedWorktree(sourceRepo, task, requestedBranch, 
       continue;
     }
     if (await branchExists(sourceRepo, branch)) {
+      if (requestedBranch && resume.expectedSha) {
+        if (!/^[a-f0-9]{40,64}$/i.test(resume.expectedSha) || await git(sourceRepo, ['rev-parse', `refs/heads/${branch}`]) !== resume.expectedSha) {
+          throw new Error('Resume branch head changed; inspect it before continuing');
+        }
+        for (const attached of await listWorktrees(sourceRepo)) {
+          if (await git(attached, ['branch', '--show-current']) !== branch) continue;
+          const ownerId = path.basename(attached);
+          const meta = await readJson(path.join(dirs.runs, ownerId, 'meta.json'));
+          if (!isInsideDir(dirs.worktrees, attached) || !meta || meta.taskBranch !== branch || !pathsEqual(meta.sourceRepo, sourceRepo)) {
+            throw new Error('Existing branch is checked out outside its managed run');
+          }
+          if ((await gitState(attached)).status.trim()) throw new Error('Resume worktree has uncommitted files; preserve and inspect them first');
+          return { worktree: attached, branch, runId: ownerId, createdByOrchestrator: true };
+        }
+        await git(sourceRepo, ['worktree', 'add', worktree, branch]);
+        return { worktree, branch, runId, createdByOrchestrator: true };
+      }
       lastError = `branch already exists: ${branch}`;
       if (requestedBranch) {
         throw new Error(`Refusing to reuse existing branch ${branch}. Choose a new --branch name.`);
@@ -226,7 +270,8 @@ export function sourceFingerprint(info) {
 
 export function workingTreeChanged(before, after) {
   return (after.status || '').trim() !== (before.status || '').trim()
-    || (after.patch || '') !== (before.patch || '');
+    || (after.patch || '') !== (before.patch || '')
+    || JSON.stringify(after.untracked || []) !== JSON.stringify(before.untracked || []);
 }
 
 export async function listWorktrees(repo) {
@@ -258,7 +303,10 @@ export async function removeOrchestratorWorktree({ sourceRepo, worktree, runId, 
   if (!registered) {
     return { removed: false, reason: 'path is not a registered git worktree' };
   }
-  const rm = await gitAllowFail(sourceRepo, ['worktree', 'remove', '--force', worktree]);
+  const state = await gitState(worktree);
+  if (state.status.trim()) return { removed: false, reason: 'uncommitted files; review and commit them first' };
+  // Git also protects ignored/untracked files. Never force removal.
+  const rm = await gitAllowFail(sourceRepo, ['worktree', 'remove', worktree]);
   if (rm.code !== 0) {
     return { removed: false, reason: rm.stderr || rm.stdout || 'git worktree remove failed' };
   }

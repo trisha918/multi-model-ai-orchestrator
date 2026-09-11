@@ -1,5 +1,7 @@
 # Installation
 
+New users: follow the step-by-step [English](START-HERE.md) or [Persian](START-HERE-FA.md) guide. It includes prerequisites, choosing just one worker, preparing a target repository and optional modules. To test the unreleased improvements, use the branch-specific clone command there; the default-branch instructions below do not imply those additions are already released.
+
 First-time Windows setup for Multi-Model AI Orchestrator **v1.1.0**.
 
 ## 1. Clone and install

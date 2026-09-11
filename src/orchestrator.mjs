@@ -1,3 +1,10 @@
+import { memoryContext } from './memory.mjs';
+import { listRuns } from './run-history.mjs';
+import { recommendRoute } from './learned-routing.mjs';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { atomicJson, appendEvent, acquireFileLock, releaseFileLock } from './local-store.mjs';
+import { runResult, saveRunResult } from './run-history.mjs';
+import { controlledExecutor } from './run-controls.mjs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -43,9 +50,17 @@ import {
   writeRunCheckpoint,
 } from './worker-isolation.mjs';
 
-let config = loadConfig();
+const runContext = new AsyncLocalStorage();
+const config = new Proxy({}, { get: (_target, key) => (runContext.getStore()?.config || loadConfig())[key] });
 
 export function parseTaskArgs(argv, defaults = {}) {
+  const values = new Set(['--repo','--task','--task-file','--mode','--max-fix-rounds','--branch','--cursor-model','--codex-model','--gemini-model','--model','--model-id','--max-seconds','--max-processes','--routing']);
+  const switches = new Set(['--task-stdin','--windows-unelevated','--in-place','--commit-on-pass','--memory','--help']);
+  for (let i = 0; i < argv.length; i++) {
+    if (values.has(argv[i])) {
+      if (argv[++i] === undefined) throw new Error(`${argv[i-1]} requires a value`);
+    } else if (!switches.has(argv[i])) throw new Error(`Unknown run option: ${argv[i]}`);
+  }
   const out = {
     mode: defaults.defaultMode || 'auto',
     repo: '',
@@ -63,10 +78,18 @@ export function parseTaskArgs(argv, defaults = {}) {
     provided: { mode: false, cursorModel: false, codexModel: false, geminiModel: false, model: false, modelId: false, task: false, taskFile: false, taskStdin: false },
     taskFile: '',
     taskStdin: false,
+    maxSeconds: 3600,
+    maxProcesses: 20,
+    routing: 'heuristic',
+    memory: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--repo') out.repo = argv[++i] ?? '';
+    if (a === '--max-seconds') out.maxSeconds = Number(argv[++i]);
+    else if (a === '--max-processes') out.maxProcesses = Number(argv[++i]);
+    else if (a === '--routing') out.routing = argv[++i];
+    else if (a === '--memory') out.memory = true;
+    else if (a === '--repo') out.repo = argv[++i] ?? '';
     else if (a === '--task') {
       out.task = argv[++i] ?? '';
       out.provided.task = true;
@@ -105,6 +128,8 @@ export function parseTaskArgs(argv, defaults = {}) {
   if (!out.provided.cursorModel && defaults.cursorModel) out.cursorModel = defaults.cursorModel;
   if (!out.provided.codexModel && defaults.codexModel) out.codexModel = defaults.codexModel;
   if (!out.provided.geminiModel && defaults.geminiModel) out.geminiModel = defaults.geminiModel;
+  if (!Number.isFinite(out.maxSeconds) || out.maxSeconds <= 0 || !Number.isInteger(out.maxProcesses) || out.maxProcesses < 1) throw new Error('Run budgets must be positive numbers; --max-processes must be an integer');
+  if (!Number.isInteger(out.maxFixRounds)) throw new Error('--max-fix-rounds must be an integer from 0 to 5');
   return out;
 }
 
@@ -328,7 +353,6 @@ function reviewDecision(review) {
   if (first === 'PASS') return 'PASS';
   if (first === 'NEEDS_FIXES') return 'NEEDS_FIXES';
   if (/\bNEEDS_FIXES\b/i.test(review)) return 'NEEDS_FIXES';
-  if (/\bPASS\b/i.test(review)) return 'PASS';
   return 'UNKNOWN';
 }
 
@@ -367,7 +391,44 @@ async function independentTests(repo, runDir, exec = executeProcess) {
 }
 
 export async function runTask(argv = process.argv.slice(2), options = {}) {
-  config = options.config || await loadResolvedConfig(options.env || process.env);
+  const env = options.env || process.env;
+  const resolvedConfig = options.config || await loadResolvedConfig(env);
+  if (options.printTaskAndExit || env.AI_ORCHESTRATOR_PRINT_TASK_AND_EXIT === '1') {
+    return runContext.run({ config: resolvedConfig }, () => runTaskInternal(argv, options));
+  }
+  const runId = makeRunId('task');
+  const runDir = path.join(runtimeDirs(env).runs, runId);
+  const events = path.join(runDir, 'events.jsonl');
+  const started = Date.now();
+  let detailed = runResult({ runId, status: 'RUNNING', runLog: runDir });
+  const lease = await acquireFileLock(path.join(runDir, 'active.lock'));
+  if (!lease.ok) throw new Error(lease.reason);
+  let controls;
+  let code = 1;
+  const previousExitCode = process.exitCode;
+  try {
+    await saveRunResult(detailed, env);
+    const args = parseTaskArgs(argv, resolvedConfig);
+    controls = controlledExecutor(options.executeProcess || executeProcess, { maxSeconds: args.maxSeconds, maxProcesses: args.maxProcesses, env, events });
+    code = await runContext.run({ config: resolvedConfig }, () => runTaskInternal(argv, {
+      ...options, runId, executeProcess: controls.exec,
+      onDetailedResult: value => { detailed = runResult({ ...detailed, ...value }); },
+    }));
+  } catch (error) {
+    detailed.error = error.message;
+    detailed.failedStage = error.stageStatus || 'Orchestrator';
+    console.error(error.message);
+  } finally {
+    detailed = runResult({ ...detailed, ...controls?.usage(), ok: code === 0 && detailed.ok, exitCode: code,
+      status: code === 0 && detailed.ok ? 'COMPLETED' : 'FAILED', finishedAt: new Date().toISOString(), durationMs: Date.now() - started });
+    try { await saveRunResult(detailed, env); } finally { await releaseFileLock(lease); process.exitCode = previousExitCode; }
+  }
+  if (options.onResult) await options.onResult(detailed);
+  console.log('Result:', path.join(runDir, 'result.json'));
+  return code;
+}
+
+async function runTaskInternal(argv, options) {
   const args = parseTaskArgs(argv, config);
   args.env = options.env || process.env;
   try {
@@ -384,7 +445,7 @@ export async function runTask(argv = process.argv.slice(2), options = {}) {
   }
 
   if ((options.env || process.env).AI_ORCHESTRATOR_PRINT_TASK_AND_EXIT === '1' || options.printTaskAndExit) {
-    process.stdout.write(args.task);
+    (options.stdout || process.stdout).write(args.task);
     return 0;
   }
 
@@ -398,7 +459,12 @@ export async function runTask(argv = process.argv.slice(2), options = {}) {
 
   let route;
   try {
+    if (!['heuristic','learned'].includes(args.routing)) throw new Error('Use --routing heuristic or learned');
     route = resolveRoute(args.task, args.mode);
+    if (args.routing === 'learned' && args.mode === 'auto' && !args.provided.model && !args.provided.modelId && !args.provided.cursorModel && !args.provided.codexModel && !args.provided.geminiModel) {
+      const suggestion = recommendRoute(await listRuns(args.env), { repo: args.repo, task: args.task });
+      if (suggestion.learned) route = { ...route, route: suggestion.route, reason: suggestion.reason };
+    }
   } catch (e) {
     console.error(e instanceof Error ? e.message : String(e));
     process.exitCode = 2;
@@ -424,7 +490,7 @@ export async function runTask(argv = process.argv.slice(2), options = {}) {
   }
 
   const startedAt = Date.now();
-  const runId = makeRunId(args.task);
+  const runId = options.runId || makeRunId(args.task);
   const dirs = runtimeDirs(options.env || process.env);
   const runDir = path.join(dirs.runs, runId);
   await mkdir(runDir, { recursive: true });
@@ -503,8 +569,11 @@ const result = {
   fixRounds: 0,
 };
 
-function addStage(name, status, durationMs, extra = {}) {
-  stages.push({ name, status, durationMs: durationMs || 0, ...extra });
+async function addStage(name, status, durationMs, extra = {}) {
+  const stage = { name, status, durationMs: durationMs || 0, ...extra };
+  stages.push(stage);
+  await appendEvent(path.join(runDir, 'events.jsonl'), 'stage.finished', { stage });
+  await atomicJson(path.join(runDir, 'stages.json'), stages);
 }
 
 async function persistCheckpoint(extra = {}) {
@@ -528,6 +597,7 @@ async function persistCheckpoint(extra = {}) {
 }
 
 async function pinWorkspace(stage) {
+  await appendEvent(path.join(runDir, 'events.jsonl'), 'stage.started', { stage });
   const identity = await verifyRunWorkspace({
     workspace: repo,
     runId: isolatedMeta.runId,
@@ -552,7 +622,7 @@ async function pinWorkspace(stage) {
 
 try {
   if (!args.inPlace) {
-    const isolated = await createIsolatedWorktree(sourceInfo.root, args.task, args.branch, runId, options.env || process.env);
+    const isolated = await createIsolatedWorktree(sourceInfo.root, args.task, args.branch, runId, options.env || process.env, options.resume);
     repo = isolated.worktree;
     worktree = isolated.worktree;
     taskBranch = isolated.branch;
@@ -586,7 +656,8 @@ try {
   let tests = { status: 'SKIP', reason: 'Not a modifying route', durationMs: 0, command: '', runner: '', exitCode: null };
   let finalDecision = 'SUCCESS';
 
-  const prompts = workerPrompts(args.task);
+  const noteContext = args.memory ? await memoryContext(sourceInfo.root, args.task, { env: args.env }) : '';
+  const prompts = workerPrompts(args.task + noteContext);
   const codingPrompt = prompts.coding;
   const sendToWorker = (kind, text) => {
     if (typeof options.onWorkerPrompt === 'function') options.onWorkerPrompt({ kind, text });
@@ -606,7 +677,7 @@ try {
     result.implementation = 'PASS';
     result.implMs = out.proc.durationMs;
     timings.cursorMs += out.proc.durationMs;
-    addStage('cursor-implementation', 'PASS', out.proc.durationMs, pin);
+    await addStage('cursor-implementation', 'PASS', out.proc.durationMs, pin);
     usageLog.push(workerUsage({ worker: 'cursor', model: cursorModelId, durationMs: out.proc.durationMs, attempts: out.proc.attempts }));
     const testPin = await pinWorkspace('tests');
     tests = await independentTests(testPin.cwd, runDir, exec);
@@ -618,7 +689,7 @@ try {
     result.review = 'PASS';
     result.reviewMs = out.proc.durationMs;
     timings.geminiMs += out.proc.durationMs;
-    addStage('gemini-analysis', 'PASS', out.proc.durationMs, pin);
+    await addStage('gemini-analysis', 'PASS', out.proc.durationMs, pin);
     usageLog.push(workerUsage({ worker: 'gemini', model: geminiModelId || 'antigravity', durationMs: out.proc.durationMs, attempts: out.proc.attempts, extra: { usage: out.usage } }));
     console.log('\n\nFINAL (Gemini/Antigravity):\n', out.text);
   } else if (route.route === 'CODEX') {
@@ -629,7 +700,7 @@ try {
     result.implementation = 'PASS';
     result.implMs = out.proc.durationMs;
     timings.codexMs += out.proc.durationMs;
-    addStage('codex-implementation', 'PASS', out.proc.durationMs, pin);
+    await addStage('codex-implementation', 'PASS', out.proc.durationMs, pin);
     usageLog.push(workerUsage({ worker: 'codex', model: codexModelId || 'codex', durationMs: out.proc.durationMs, attempts: out.proc.attempts }));
     const testPin = await pinWorkspace('tests');
     tests = await independentTests(testPin.cwd, runDir, exec);
@@ -642,7 +713,7 @@ try {
     result.plan = 'PASS';
     result.planMs = plan.proc.durationMs;
     timings.cursorMs += plan.proc.durationMs;
-    addStage('cursor-plan', 'PASS', plan.proc.durationMs, planPin);
+    await addStage('cursor-plan', 'PASS', plan.proc.durationMs, planPin);
     usageLog.push(workerUsage({ worker: 'cursor', model: cursorModelId, durationMs: plan.proc.durationMs, attempts: plan.proc.attempts }));
 
     result.implementation = 'FAIL';
@@ -653,13 +724,13 @@ try {
     result.implementation = 'PASS';
     result.implMs = implementation.proc.durationMs;
     timings.codexMs += implementation.proc.durationMs;
-    addStage('codex-implementation', 'PASS', implementation.proc.durationMs, implPin);
+    await addStage('codex-implementation', 'PASS', implementation.proc.durationMs, implPin);
     usageLog.push(workerUsage({ worker: 'codex', model: codexModelId || 'codex', durationMs: implementation.proc.durationMs, attempts: implementation.proc.attempts }));
 
     const testsPin = await pinWorkspace('tests');
     tests = await independentTests(testsPin.cwd, runDir, exec);
     timings.testsMs += tests.durationMs || 0;
-    addStage('tests', tests.status, tests.durationMs || 0, testsPin);
+    await addStage('tests', tests.status, tests.durationMs || 0, testsPin);
 
     let round = 0;
     let decision = 'UNKNOWN';
@@ -688,7 +759,7 @@ try {
         decision = reviewDecision(reviewText);
         result.reviewMs = (result.reviewMs || 0) + review.proc.durationMs;
         timings.geminiMs += review.proc.durationMs;
-        addStage(reviewStage, decision === 'PASS' ? 'PASS' : decision, review.proc.durationMs, reviewPin);
+        await addStage(reviewStage, decision === 'PASS' ? 'PASS' : decision, review.proc.durationMs, reviewPin);
         usageLog.push(workerUsage({ worker: 'gemini', model: geminiModelId || 'antigravity', durationMs: review.proc.durationMs, attempts: review.proc.attempts, extra: { usage: review.usage } }));
         console.log(`\n\nREVIEW DECISION: ${decision}\n`);
         if (decision === 'PASS') break;
@@ -720,13 +791,13 @@ try {
       await writeFile(path.join(runDir, `fix-round-${round}.txt`), fix.text, 'utf8');
       result.implementation = 'PASS';
       timings.codexMs += fix.proc.durationMs;
-      addStage(`codex-fix-${round}`, 'PASS', fix.proc.durationMs, fixPin);
+      await addStage(`codex-fix-${round}`, 'PASS', fix.proc.durationMs, fixPin);
       usageLog.push(workerUsage({ worker: 'codex', model: codexFixModelId || 'codex', durationMs: fix.proc.durationMs, attempts: fix.proc.attempts }));
 
       const fixTestsPin = await pinWorkspace(`tests-${round}`);
       tests = await independentTests(fixTestsPin.cwd, runDir, exec);
       timings.testsMs += tests.durationMs || 0;
-      addStage(`tests-${round}`, tests.status, tests.durationMs || 0, fixTestsPin);
+      await addStage(`tests-${round}`, tests.status, tests.durationMs || 0, fixTestsPin);
     }
 
     result.fixRounds = round;
@@ -828,6 +899,9 @@ try {
 
   result.commit = commitResult.hash || (commitResult.reason ? commitResult.reason : 'none');
   if (!success) result.ok = false;
+  options.onDetailedResult?.({ ...result, runId, status: success ? 'COMPLETED' : 'FAILED', repository: sourceInfo.root, sourceHead: sourceInfo.head,
+    classification: classifyTask(args.task), models: modelsJsonPayload({ route: route.route, resolved: modelResolved }),
+    commit: commitResult.hash || (args.commitOnPass ? await import('./workspace.mjs').then(m => m.git(sourceInfo.root, ['rev-parse', taskBranch])) : ''), worktree });
   console.log(summaryBlock(result));
   return result.ok ? 0 : 1;
 } catch (err) {
@@ -863,6 +937,8 @@ try {
   await writeFile(path.join(runDir, 'timings.json'), JSON.stringify(timings, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'stages.json'), JSON.stringify(stages, null, 2), 'utf8');
   await writeFile(path.join(runDir, 'workspace-trace.json'), JSON.stringify(workspaceTrace, null, 2), 'utf8');
+  options.onDetailedResult?.({ ...result, runId, status: 'FAILED', repository: sourceInfo.root, sourceHead: sourceInfo.head,
+    classification: classifyTask(args.task), models: modelsJsonPayload({ route: route.route, resolved: modelResolved }), error: msg, worktree });
   console.error('\nFAILED:\n', msg);
   console.log(summaryBlock(result));
   if (worktree) console.error(`\nThe isolated worktree was kept for debugging:\n${worktree}`);
