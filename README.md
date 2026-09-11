@@ -4,6 +4,10 @@ A local multi-model coding orchestrator for Cursor that routes development tasks
 
 Current version: **v1.1.0**
 
+**Start with the [beginner guide](docs/START-HERE.md) or [راهنمای فارسی](docs/START-HERE-FA.md).** You can use existing local commands without GitHub automation. This development branch adds execution history, time/process budgets, optional repository notes, a foreground local queue and history-based routing. See [module contracts and limitations](docs/LOCAL-MODULES.md).
+
+These additions are not a published release yet. To try them before merge, use the branch-specific installation instructions in the beginner guide. Existing release instructions below describe the original v1.1 interface.
+
 [![CI](https://github.com/trisha918/multi-model-ai-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/trisha918/multi-model-ai-orchestrator/actions/workflows/ci.yml)
 
 **Validated platform: Windows.** macOS and Linux are not claimed and have not been tested as supported hosts.
@@ -398,7 +402,7 @@ If nothing matches: `Tests: SKIP`. SKIP is not PASS. FAIL/TIMEOUT blocks `--comm
 
 `AI_WORKER_MAX_RETRIES` default **1**. Retries apply only to transient CLI/network failures, not test failures, auth failures, dirty repos, or review `NEEDS_FIXES`.
 
-Successful worktrees are removed by default (`AI_KEEP_SUCCESS_WORKTREES=false`). Failed worktrees are kept (`AI_KEEP_FAILED_WORKTREES=true`).
+Clean successful worktrees may be removed by default (`AI_KEEP_SUCCESS_WORKTREES=false`). Uncommitted work, including new files, is preserved; removal never uses `--force`. Failed worktrees are kept. Generic cleanup preserves worktree directories and active/paired run records; remove reviewed clean worktrees explicitly with Git.
 
 ```powershell
 ai-orchestrator cleanup

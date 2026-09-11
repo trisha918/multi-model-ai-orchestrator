@@ -1,5 +1,11 @@
 # GitHub automation
 
+**Optional:** local `run`, Cursor commands, history, memory, queue and measured routing work without this module. New users can start with [START-HERE.md](START-HERE.md) or [START-HERE-FA.md](START-HERE-FA.md).
+
+Development-branch changes: required tests/review accept only PASS, including on resume; SKIP and UNKNOWN do not pass required gates. Choose TEAM if independent AI review is required. A solo coding run has review SKIP. CI Check Runs and commit statuses are combined, and reads paginate. A failed resumed CI observation enters the bounded fix loop when automation is enabled. Run live commands from the matching target checkout; new Issue runs require its HEAD to match the fetched remote default branch. [Details and crash recovery](LOCAL-MODULES.md).
+
+Install the reviewed orchestrator revision on the runner before testing; the workflow invokes its installed global CLI. Upgrading the repository checkout alone does not upgrade that installation. Native worktrees and filtered subprocess environments are not a container sandbox.
+
 Optional v1.1 engine: **GitHub Issue → AI implementation → PR → CI → fix loop → ready for human merge**.
 
 Default mode is **manual**. Nothing Issue-related runs until you enable a repository config **and** a trusted actor adds `ai-auto`.

@@ -1,5 +1,7 @@
 # Security
 
+Development-branch changes and boundaries are documented in [LOCAL-MODULES.md](LOCAL-MODULES.md). Worker/test environments exclude GitHub tokens and arbitrary inherited secrets; known secret values and token patterns are redacted from buffered process output. This does not isolate the Windows account, local credential stores, shared files or project test code. Runtime task/output/history/memory files may contain private project data. Do not publish them without review.
+
 GitHub Issue automation is **optional** and dangerous if misconfigured on a public repository.
 
 ## Self-hosted runners

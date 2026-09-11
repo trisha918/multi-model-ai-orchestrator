@@ -1,5 +1,9 @@
 # Configuration
 
+For beginner examples and independent local modules, see [START-HERE.md](START-HERE.md) / [راهنمای فارسی](START-HERE-FA.md).
+
+Local run controls are CLI flags: `--max-seconds 3600`, `--max-processes 20`, `--memory` (off by default), and `--routing heuristic|learned` (heuristic by default). These flags do not enable GitHub automation and are not user-config keys. Unknown flags and invalid numeric budgets fail before worker launch. Explicit `--model auto` takes precedence over a configured manual model. Stale model catalogs are refreshed rather than silently treated as current availability.
+
 ## Precedence
 
 Highest first:
