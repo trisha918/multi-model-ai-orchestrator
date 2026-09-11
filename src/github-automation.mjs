@@ -140,12 +140,46 @@ function dryLog(plan, message, extra = {}) {
 
 function applyImplementationResult(state, result, config) {
   state.localTests = result?.tests || 'UNKNOWN';
-  state.review = result?.review || (config.review.required ? 'UNKNOWN' : 'SKIP');
+  // Optional review must never persist as UNKNOWN — that value only means
+  // "required review not yet available" and must not force a re-implement on resume.
+  if (config.review.required) {
+    state.review = result?.review || 'UNKNOWN';
+  } else {
+    const review = result?.review;
+    state.review = (!review || review === 'UNKNOWN') ? 'SKIP' : review;
+  }
   if (result?.commit) state.commitSha = result.commit;
   if (result?.route) state.route = result.route;
   if (result?.model) state.model = result.model;
   if (result?.branch) state.branch = result.branch;
   state.branchPushed = false;
+}
+
+/**
+ * Resume past implementation when local work already completed.
+ * UNKNOWN review must not re-run workers when review is not required.
+ */
+export function shouldSkipImplementationOnResume({
+  state,
+  config,
+  decision,
+  skipGitPush = false,
+  resumeWaitingForCi = false,
+} = {}) {
+  if (state?.prNumber) return true;
+  if (skipGitPush || resumeWaitingForCi) return true;
+  if (decision?.action !== 'resume') return false;
+  if (state?.stage !== 'LOCAL_TESTS') return false;
+  if (!state?.branch || !state?.commitSha) return false;
+
+  const testsOk = config?.tests?.required
+    ? state.localTests === 'PASS'
+    : ['PASS', 'SKIP'].includes(state.localTests);
+  if (!testsOk) return false;
+
+  if (config?.review?.required) return state.review === 'PASS';
+  // review.required === false: PASS / SKIP / UNKNOWN / missing are all safe to continue
+  return true;
 }
 
 export async function shouldSkipGitPush({ client, owner, name, state, ignoreExistingPr = false } = {}) {
@@ -474,20 +508,29 @@ export async function runIssueAutomation({
       && state.stage === 'WAITING_FOR_CI'
       && Boolean(state.prNumber);
 
-    const resumeLocalTests = skipGitPush || resumeWaitingForCi || (
+    // Recover optional UNKNOWN review left by crash / older persists so later
+    // gates and status comments stay consistent without re-running workers.
+    if (
       decision.action === 'resume'
       && state.stage === 'LOCAL_TESTS'
-      && (config.tests.required ? state.localTests === 'PASS' : ['PASS', 'SKIP'].includes(state.localTests))
-      && (config.review.required ? state.review === 'PASS' : ['PASS', 'SKIP'].includes(state.review))
-      && !state.prNumber
-      && Boolean(state.branch && state.commitSha)
-    );
+      && state.commitSha
+      && !config.review.required
+      && (state.review === 'UNKNOWN' || !state.review)
+    ) {
+      state.review = 'SKIP';
+    }
 
     // Resume from IMPLEMENTING/FIXING/LOCAL_TESTS must not rewind to STARTED
     // (IMPLEMENTING → STARTED is illegal).
     const skipStartedHop = decision.action === 'resume'
       && !['IDLE', 'STARTED'].includes(state.stage || 'IDLE');
-    const skipImplementation = Boolean(state.prNumber) || resumeLocalTests;
+    const skipImplementation = shouldSkipImplementationOnResume({
+      state,
+      config,
+      decision,
+      skipGitPush,
+      resumeWaitingForCi,
+    });
 
     if (decision.action !== 'resume' || !state.mode) state.mode = config.automation.mode;
     state.maxAttempts = config.automation.max_fix_attempts || state.maxAttempts;
@@ -638,9 +681,15 @@ export async function runIssueAutomation({
       return { crashed: false };
     }
 
+    // Missing required review always stops on LOCAL_TESTS resume.
+    // FAILED required tests only stop here when workers are already skipped
+    // (e.g. PR exists); otherwise implementRound recovers.
     const resumeMissingRequiredGate = decision.action === 'resume'
       && state.stage === 'LOCAL_TESTS'
-      && ((!config.tests.required || state.localTests === 'PASS') === false || (!config.review.required || state.review === 'PASS') === false);
+      && (
+        (config.review.required && state.review !== 'PASS')
+        || (skipImplementation && config.tests.required && state.localTests !== 'PASS')
+      );
     if (resumeMissingRequiredGate) {
       applyStage(state, 'HUMAN_REVIEW_REQUIRED');
       state.lastDiagnosis = 'Required local tests or AI review did not pass';

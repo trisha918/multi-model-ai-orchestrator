@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseRepoConfigText } from './github-config.mjs';
 import { createMemoryGithubClient } from './github-client.mjs';
-import { decideTrigger, recordCiResult, runIssueAutomation, shouldSkipGitPush, CI_STATUS } from './github-automation.mjs';
+import { decideTrigger, recordCiResult, runIssueAutomation, shouldSkipGitPush, shouldSkipImplementationOnResume, CI_STATUS } from './github-automation.mjs';
 import { acquireIssueLock, loadIssueState, saveIssueState, emptyState, isAllowedTransition } from './github-state.mjs';
 import { TRIGGER_LABEL } from './github-labels.mjs';
 
@@ -253,6 +253,138 @@ test('crash after LOCAL_TESTS persist resumes without losing commit or re-implem
     const saved = await loadIssueState('owner/app', 42, env);
     assert.equal(saved.commitSha, implCommit);
     assert.equal(saved.stage, 'READY_FOR_HUMAN_MERGE');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('UNKNOWN optional review after LOCAL_TESTS does not re-run implementation', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-unknown-review-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const implCommit = 'dddddddddddddddddddddddddddddddddddddddd';
+  const implBranch = 'ai/issue-42-fix-checkout-validation';
+  const client = createMemoryGithubClient(seedIssue());
+  let implCalls = 0;
+  let pushCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 42, title: 'Fix checkout validation', html_url: 'https://github.com/owner/app/issues/42' },
+      }),
+      stage: 'LOCAL_TESTS',
+      localTests: 'PASS',
+      review: 'UNKNOWN',
+      commitSha: implCommit,
+      branch: implBranch,
+      prNumber: null,
+      mode: 'assisted',
+    }, env);
+    assert.equal(
+      shouldSkipImplementationOnResume({
+        state: await loadIssueState('owner/app', 42, env),
+        config: assisted,
+        decision: { action: 'resume' },
+      }),
+      true,
+    );
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('UNKNOWN optional review must not re-implement');
+      },
+      gitPush: async ({ branch }) => {
+        pushCalls += 1;
+        assert.equal(branch, implBranch);
+        return { sha: implCommit };
+      },
+      waitForCi: async () => ({ status: CI_STATUS.PASS, summary: 'ok' }),
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(pushCalls, 1);
+    assert.equal(result.state.stage, 'READY_FOR_HUMAN_MERGE');
+    assert.equal(result.state.review, 'SKIP');
+    assert.equal(result.state.commitSha, implCommit);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('incomplete LOCAL_TESTS without commit still allows implementation', async () => {
+  assert.equal(
+    shouldSkipImplementationOnResume({
+      state: {
+        stage: 'LOCAL_TESTS',
+        localTests: 'PASS',
+        review: 'UNKNOWN',
+        branch: 'ai/issue-1-x',
+        commitSha: '',
+        prNumber: null,
+      },
+      config: assisted,
+      decision: { action: 'resume' },
+    }),
+    false,
+  );
+});
+
+test('LOCAL_TESTS resume with FAILED tests does not skip implementation', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-failed-tests-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const priorCommit = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+  const fixedCommit = 'ffffffffffffffffffffffffffffffffffffffff';
+  const implBranch = 'ai/issue-42-fix-checkout-validation';
+  const client = createMemoryGithubClient(seedIssue());
+  let implCalls = 0;
+  try {
+    const persisted = {
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 42, title: 'Fix checkout validation', html_url: 'https://github.com/owner/app/issues/42' },
+      }),
+      stage: 'LOCAL_TESTS',
+      localTests: 'FAIL',
+      review: 'SKIP',
+      commitSha: priorCommit,
+      branch: implBranch,
+      prNumber: null,
+      mode: 'assisted',
+    };
+    await saveIssueState(persisted, env);
+    assert.equal(
+      shouldSkipImplementationOnResume({
+        state: persisted,
+        config: assisted,
+        decision: { action: 'resume' },
+      }),
+      false,
+    );
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch }) => {
+        implCalls += 1;
+        assert.equal(branch, implBranch);
+        return { ok: true, tests: 'PASS', review: 'SKIP', commit: fixedCommit, branch };
+      },
+      gitPush: async ({ branch }) => {
+        assert.equal(branch, implBranch);
+        return { sha: fixedCommit };
+      },
+      waitForCi: async () => ({ status: CI_STATUS.PASS, summary: 'ok' }),
+    });
+    assert.equal(implCalls, 1);
+    assert.equal(result.state.commitSha, fixedCommit);
+    assert.equal(result.state.localTests, 'PASS');
+    assert.equal(result.state.stage, 'READY_FOR_HUMAN_MERGE');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
