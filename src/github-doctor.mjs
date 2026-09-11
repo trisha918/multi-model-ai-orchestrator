@@ -3,11 +3,11 @@ import { detectGithubAuth } from './github-client.mjs';
 import { loadRepoAutomationConfig, isIssueAutomationActive } from './github-config.mjs';
 import { LABEL_DEFINITIONS } from './github-labels.mjs';
 import { installationInfo } from './paths.mjs';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { emptyState, loadIssueState, parseRepoSlug, issueStatePath } from './github-state.mjs';
 import { readGithubCiStatus } from './github-automation.mjs';
-import { probeGithubRepo, summarizeAiRunners } from './github-probe.mjs';
+import { probeGithubRepo, summarizeAiRunners, summarizeAiIssueWorkflowPermissions } from './github-probe.mjs';
 
 export async function collectGithubDoctor({ env = process.env, cwd = process.cwd(), checkAuth } = {}) {
   const ghPath = findOnPath(process.platform === 'win32' ? ['gh.exe', 'gh.cmd'] : ['gh']);
@@ -106,6 +106,7 @@ export async function collectIssueDoctor({
     path.join(cwd, '.github', 'ai-orchestrator.yml'),
   ];
   const workflowPath = workflowCandidates.find(p => existsSync(p));
+  let workflowPermissions = null;
   if (!workflowPath) {
     problems.push('Workflow configuration: ai-issue.yml / ai-orchestrator.yml not found in cwd');
     if (!configText.startsWith('INVALID') && loaded.missing) {
@@ -113,6 +114,22 @@ export async function collectIssueDoctor({
     }
   } else if (loaded.ok || loaded.missing) {
     configText = `${configText}; workflow=${path.relative(cwd, workflowPath) || workflowPath}`;
+  }
+
+  const aiIssuePath = path.join(cwd, '.github', 'workflows', 'ai-issue.yml');
+  if (existsSync(aiIssuePath)) {
+    try {
+      workflowPermissions = summarizeAiIssueWorkflowPermissions(readFileSync(aiIssuePath, 'utf8'));
+      if (!workflowPermissions.ciOk) {
+        problems.push(`Workflow CI permissions: ${workflowPermissions.detail}`);
+      } else if (!workflowPermissions.ok) {
+        problems.push(`Workflow permissions: ${workflowPermissions.detail}`);
+      }
+    } catch (e) {
+      problems.push(`Workflow permissions: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  } else if (workflowPath && path.basename(workflowPath) !== 'ai-issue.yml') {
+    problems.push('Workflow CI permissions: ai-issue.yml not found (needs actions/checks/statuses read)');
   }
 
   const stateFile = issueStatePath(slug, n, env);
@@ -185,6 +202,7 @@ export async function collectIssueDoctor({
     config: configText,
     authentication: auth.ok ? `OK (${auth.detail})` : `ACTION REQUIRED — ${auth.detail}`,
     runners: runners.detail,
+    workflowPermissions,
     stateFile: existsSync(stateFile) ? stateFile : `missing (${stateFile})`,
     problems,
     state: effective,
@@ -195,7 +213,7 @@ export function formatIssueDoctor(report) {
   const problems = report.problems?.length
     ? report.problems.map(p => `- ${p}`).join('\n')
     : 'none';
-  return [
+  const lines = [
     `Repository: ${report.repository}`,
     `Issue: ${report.issue}`,
     `Stage: ${report.stage}`,
@@ -205,8 +223,11 @@ export function formatIssueDoctor(report) {
     `GitHub CI: ${report.githubCi}`,
     `Config: ${report.config}`,
     `Authentication: ${report.authentication}`,
-    `Problems:`,
-    problems,
-  ].join('\n');
+  ];
+  if (report.workflowPermissions) {
+    lines.push(`CI observation: ${report.workflowPermissions.detail}`);
+  }
+  lines.push('Problems:', problems);
+  return lines.join('\n');
 }
 

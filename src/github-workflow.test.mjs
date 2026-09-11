@@ -29,13 +29,37 @@ test('ai-issue workflow does not run AI on pull_request events', () => {
     assert.match(y, /needs\.authorize\.outputs\.allowed == 'true'/);
     assert.match(y, /runs-on: ubuntu-latest/);
     assert.match(y, /secrets\.GITHUB_TOKEN/);
-    assert.match(y, /checks: read/);
     assert.match(y, /default_branch/);
     assert.match(y, /getCollaboratorPermissionLevel/);
     assert.match(y, /node\.exe \$entry @\('github','authorize'/);
     assert.match(y, /node\.exe \$entry @\('github','issue','run'/);
     assert.doesNotMatch(y, /(?:^|\n)\s*ai-orchestrator @\(/);
     assert.doesNotMatch(y, /echo \$\{\{ secrets/);
+  }
+});
+
+test('ai-issue automate job grants CI observation and write permissions', () => {
+  for (const rel of aiIssueWorkflows) {
+    const y = loadWorkflow(rel);
+    assert.match(y, /statuses: read/);
+    assert.match(y, /checks: read/);
+    assert.match(y, /actions: read/);
+    assert.match(y, /contents: write/);
+    assert.match(y, /issues: write/);
+    assert.match(y, /pull-requests: write/);
+    // automate job must declare statuses: read (job permissions replace top-level).
+    assert.match(
+      y,
+      /\n {2}automate:\n[\s\S]*?\n {4}permissions:\n(?: {6}.+\n)*? {6}statuses: read\n/,
+    );
+    assert.match(
+      y,
+      /\n {2}automate:\n[\s\S]*?\n {4}permissions:\n(?: {6}.+\n)*? {6}checks: read\n/,
+    );
+    assert.match(
+      y,
+      /\n {2}automate:\n[\s\S]*?\n {4}permissions:\n(?: {6}.+\n)*? {6}actions: read\n/,
+    );
   }
 });
 

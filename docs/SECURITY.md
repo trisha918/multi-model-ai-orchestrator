@@ -51,7 +51,7 @@ Issue text is copied into the task as **requirements** under an explicit policy 
 - Do not store GitHub tokens in source or `ai-orchestrator.yml`.
 - Prefer GitHub CLI (`gh auth login`) or Actions `GITHUB_TOKEN` / `GH_TOKEN`.
 - Logs redact `ghp_`, `github_pat_`, `Bearer`, and `GITHUB_TOKEN=` style assignments.
-- Least privilege for the workflow: `contents: write`, `issues: write`, `pull-requests: write`, `checks: read`, `actions: read`. No repo admin.
+- Least privilege for the workflow: `contents: write`, `issues: write`, `pull-requests: write`, `checks: read`, `statuses: read`, `actions: read`. No repo admin. CI aggregation reads both Check Runs and commit statuses.
 
 ## Isolation and merge
 

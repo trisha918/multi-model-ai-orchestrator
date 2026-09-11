@@ -1,8 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { summarizeAiRunners, summarizeRepoPermissions, formatGithubRepoDoctor } from './github-probe.mjs';
+import {
+  summarizeAiRunners,
+  summarizeRepoPermissions,
+  formatGithubRepoDoctor,
+  summarizeAiIssueWorkflowPermissions,
+  probeGithubRepo,
+} from './github-probe.mjs';
 import { createMemoryGithubClient } from './github-client.mjs';
-import { probeGithubRepo } from './github-probe.mjs';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { packageRoot } from './paths.mjs';
 
 test('runner summary detects labeled online AI runner', () => {
   const none = summarizeAiRunners({ runners: [] });
@@ -32,8 +40,57 @@ test('repo doctor output never includes token values', () => {
   assert.match(text, /private/);
   assert.match(text, /Issues: write/);
   assert.match(text, /Pull requests: write/);
+  assert.match(text, /statuses: read/);
+  assert.match(text, /checks: read/);
+  assert.match(text, /actions: read/);
+  assert.doesNotMatch(text, /Actions\/checks:/);
   assert.doesNotMatch(text, /ghp_/);
   assert.match(text, /never printed/i);
+});
+
+test('example ai-issue.yml reports complete CI observation permissions', () => {
+  const y = readFileSync(
+    path.join(packageRoot(), 'examples', 'github-e2e-test', '.github', 'workflows', 'ai-issue.yml'),
+    'utf8',
+  );
+  const summary = summarizeAiIssueWorkflowPermissions(y);
+  assert.equal(summary.ciOk, true);
+  assert.equal(summary.ok, true);
+  assert.deepEqual(summary.ciMissing, []);
+  assert.match(summary.detail, /OK actions: read, checks: read, statuses: read/);
+});
+
+test('workflow missing statuses: read is not CI-ready', () => {
+  const incomplete = `
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  checks: read
+  actions: read
+jobs:
+  automate:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      actions: read
+`;
+  const summary = summarizeAiIssueWorkflowPermissions(incomplete);
+  assert.equal(summary.ciOk, false);
+  assert.ok(summary.ciMissing.includes('statuses: read'));
+  assert.match(summary.detail, /statuses/);
+  const text = formatGithubRepoDoctor({
+    repoSlug: 'o/r',
+    auth: { ok: true },
+    permissions: summarizeRepoPermissions({ private: true, permissions: { push: true } }),
+    runners: { detail: 'ONLINE: x' },
+    workflowPermissions: summary,
+  });
+  assert.match(text, /MISSING \(have missing\)/);
+  assert.match(text, /statuses:/);
+  assert.doesNotMatch(text, /Actions\/checks: read/);
 });
 
 test('probeGithubRepo uses mock client not the network', async () => {
@@ -49,4 +106,5 @@ test('probeGithubRepo uses mock client not the network', async () => {
   assert.equal(probed.permissions.private, true);
   assert.equal(probed.runners.found, true);
   assert.equal(probed.runners.online, false);
+  assert.match(probed.permissions.ciObservation, /statuses: read/);
 });

@@ -19,6 +19,7 @@ permissions:
   issues: write
   pull-requests: write
   checks: read
+  statuses: read
   actions: read
 
 jobs:
@@ -103,6 +104,7 @@ jobs:
       issues: write
       pull-requests: write
       checks: read
+      statuses: read
       actions: read
     steps:
       - name: Checkout default branch only

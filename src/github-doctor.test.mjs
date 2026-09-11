@@ -21,7 +21,24 @@ test('issue doctor report includes the required diagnostic fields', async () => 
 review:
   required: false
 `, 'utf8');
-  await writeFile(path.join(dir, '.github', 'workflows', 'ai-issue.yml'), 'name: ai-issue\n', 'utf8');
+  await writeFile(path.join(dir, '.github', 'workflows', 'ai-issue.yml'), `name: AI Issue
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  checks: read
+  statuses: read
+  actions: read
+jobs:
+  automate:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      statuses: read
+      actions: read
+`, 'utf8');
   const client = createMemoryGithubClient({
     issues: {
       6: {
@@ -92,7 +109,24 @@ test('github doctor CLI with --issue prints the issue diagnostic contract', asyn
   enabled: true
   mode: assisted
 `, 'utf8');
-  await writeFile(path.join(dir, '.github', 'workflows', 'ai-issue.yml'), 'name: ai-issue\n', 'utf8');
+  await writeFile(path.join(dir, '.github', 'workflows', 'ai-issue.yml'), `name: AI Issue
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  checks: read
+  statuses: read
+  actions: read
+jobs:
+  automate:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      statuses: read
+      actions: read
+`, 'utf8');
   const client = createMemoryGithubClient({
     issues: {
       3: {
@@ -131,6 +165,58 @@ test('github doctor CLI with --issue prints the issue diagnostic contract', asyn
     assert.match(blob, /Problems:/);
     assert.doesNotMatch(blob, /ghp_TESTTOKEN/);
     assert.equal(typeof code, 'number');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('issue doctor reports missing statuses: read as a CI permission problem', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-doctor-status-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir, GITHUB_TOKEN: 'ghp_TESTTOKEN' };
+  await mkdir(path.join(dir, '.github', 'workflows'), { recursive: true });
+  await writeFile(path.join(dir, '.github', 'ai-orchestrator.yml'), `automation:
+  enabled: true
+  mode: assisted
+review:
+  required: false
+`, 'utf8');
+  await writeFile(path.join(dir, '.github', 'workflows', 'ai-issue.yml'), `name: AI Issue
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  checks: read
+  actions: read
+jobs:
+  automate:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      actions: read
+`, 'utf8');
+  const client = createMemoryGithubClient({
+    repo: { private: true, default_branch: 'main', permissions: { admin: true, push: true } },
+    runners: [{
+      name: 'desk-win',
+      status: 'online',
+      labels: [{ name: 'self-hosted' }, { name: 'Windows' }, { name: 'ai-orchestrator' }],
+    }],
+  });
+  try {
+    const report = await collectIssueDoctor({
+      client,
+      repo: 'owner/app',
+      issueNumber: 12,
+      env,
+      cwd: dir,
+    });
+    assert.ok(report.problems.some(p => /statuses: read/i.test(p)));
+    assert.equal(report.workflowPermissions?.ciOk, false);
+    const text = formatIssueDoctor(report);
+    assert.match(text, /statuses/);
+    assert.doesNotMatch(text, /Actions\/checks: read/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

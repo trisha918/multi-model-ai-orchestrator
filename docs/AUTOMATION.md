@@ -127,7 +127,7 @@ Offline lifecycle (no GitHub network): `ai-orchestrator github simulate --fixtur
 
 Use a **private** repo (`ai-orchestrator-e2e-test`) and the template in `examples/github-e2e-test/`. Full Windows steps: [GITHUB-LIVE-TEST.md](GITHUB-LIVE-TEST.md).
 
-Workflow security: hosted `authorize` job (collaborator permission) **then** self-hosted AI job. `GITHUB_TOKEN` only.
+Workflow security: hosted `authorize` job (collaborator permission) **then** self-hosted AI job. `GITHUB_TOKEN` only. The automate job must grant `actions: read`, `checks: read`, and `statuses: read` because CI aggregation reads Check Runs and commit statuses.
 
 ## Quick start
 

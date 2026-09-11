@@ -85,6 +85,10 @@ Least privilege on the automate job:
 - `issues: write`
 - `pull-requests: write`
 - `actions: read`
+- `checks: read`
+- `statuses: read`
+
+CI observation aggregates **Check Runs and commit statuses**, so all three read scopes are required. Missing `statuses: read` yields GitHub API 403 (`Resource not accessible by integration`) when reading `/commits/.../status`.
 
 The token is never printed.
 

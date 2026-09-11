@@ -1,4 +1,5 @@
 import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
 import { validateImplementationOutput } from './run-controls.mjs';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,7 +15,7 @@ import { classifyCheckRuns, CI_STATUS, fetchGithubCiRuns } from './github-ci.mjs
 import { runTask } from './orchestrator.mjs';
 import { git, resolveGitRootFromCwd } from './workspace.mjs';
 import { collectGithubDoctor, formatGithubDoctor, collectIssueDoctor, formatIssueDoctor } from './github-doctor.mjs';
-import { formatGithubRepoDoctor, probeGithubRepo } from './github-probe.mjs';
+import { formatGithubRepoDoctor, probeGithubRepo, summarizeAiIssueWorkflowPermissions } from './github-probe.mjs';
 import { detectGithubAuth } from './github-client.mjs';
 import { cleanupOwnedTempDir } from './worker-isolation.mjs';
 
@@ -214,6 +215,11 @@ export async function cmdGithub(parsed, {
     const { owner, name, slug } = parseRepoSlug(parsed.repo);
     try {
       const probed = await probeGithubRepo(client, owner, name);
+      let workflowPermissions;
+      const aiIssuePath = path.join(cwd, '.github', 'workflows', 'ai-issue.yml');
+      if (existsSync(aiIssuePath)) {
+        workflowPermissions = summarizeAiIssueWorkflowPermissions(readFileSync(aiIssuePath, 'utf8'));
+      }
       stdout('');
       stdout(formatGithubRepoDoctor({
         repoSlug: slug,
@@ -221,7 +227,9 @@ export async function cmdGithub(parsed, {
         repo: probed.repo,
         permissions: probed.permissions,
         runners: probed.runners,
+        workflowPermissions,
       }));
+      if (workflowPermissions && !workflowPermissions.ciOk) return 1;
       return 0;
     } catch (e) {
       stdout('');
