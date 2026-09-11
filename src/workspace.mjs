@@ -12,10 +12,20 @@ const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
 
 export function canonicalPath(input) {
   const resolved = path.resolve(String(input || ''));
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return resolved;
+  let existing = resolved;
+  const suffix = [];
+  for (;;) {
+    try {
+      // Native realpath expands Windows 8.3 aliases (e.g. RUNNER~1).
+      // Resolve the nearest existing ancestor when allocating a new worktree.
+      return path.join(realpathSync.native(existing), ...suffix);
+    } catch (error) {
+      if (error.code !== 'ENOENT') return resolved;
+      const parent = path.dirname(existing);
+      if (parent === existing) return resolved;
+      suffix.unshift(path.basename(existing));
+      existing = parent;
+    }
   }
 }
 

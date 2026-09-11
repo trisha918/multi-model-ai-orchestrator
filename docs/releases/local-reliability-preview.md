@@ -24,3 +24,5 @@ This preview preserves direct CLI and Cursor skill usage while keeping GitHub au
 - GitHub CI is configured for Windows Node 20 on main, feature and Codex branches. Its result must be checked independently after push.
 
 Tests use temporary Git repositories and injected worker/GitHub adapters. They do not prove live provider compatibility or real GitHub runner behavior. Currency accounting, a full OS sandbox, distributed scheduling and automatic model learning remain outside this preview. See [the technical reference](../LOCAL-MODULES.md).
+
+The first remote Windows Node 20 run exposed an existing short-path identity problem (`RUNNER~1` versus `runneradmin`). A follow-up fix uses native path resolution, including the existing ancestor of not-yet-created worktrees, and adds a dedicated Windows alias regression. The suite now contains 222 tests; consult the CI run on the delivered commit for its result.
