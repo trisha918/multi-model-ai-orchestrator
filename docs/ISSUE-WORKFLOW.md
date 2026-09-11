@@ -15,7 +15,10 @@ Creating this Issue does **not** start AI.
 
 ## Maintainer
 
-A repository OWNER adds label `ai-auto` (and optionally `ai-codex`).
+A repository OWNER adds label `ai-auto` (and optionally a route/model label).
+
+- With **`review.required: false`**: `ai-auto` alone is enough; smart routing may pick a solo worker (`review: SKIP`).
+- With **`review.required: true`**: add **`ai-auto` and `ai-team`**. Solo routes (`ai-codex`, `ai-cursor`, …) and `ai-auto` alone are rejected before workers — they cannot satisfy required independent review.
 
 GitHub Actions concurrency key: `ai-issue-owner/app-42`.
 
@@ -43,4 +46,4 @@ See [GITHUB-LIVE-TEST.md](GITHUB-LIVE-TEST.md). Create **without** `ai-auto`:
 
 Title: `Add multiply operation and tests`
 
-Then a trusted maintainer adds `ai-auto` only (smart routing). Expected end: `ai-ready-to-merge`, PR still **OPEN**.
+Then a trusted maintainer adds `ai-auto` only (smart routing). The e2e example keeps `review.required: false` so a solo route can still reach PR + CI. Expected end: `ai-ready-to-merge`, PR still **OPEN**.

@@ -19,11 +19,13 @@ export function resolveSimulateConfig(raw) {
     });
   }
   if (typeof raw === 'string') return parseRepoConfigText(raw);
+  // When fixture omits review, keep simulate aligned with the smart-routing smoke
+  // (review optional). Explicit review.required: true still requires ai-team.
   return validateRepoConfig({
     automation: raw.automation,
     pull_request: raw.pull_request,
     tests: raw.tests,
-    review: raw.review,
+    review: raw.review ?? { required: false },
     publish: raw.publish,
   });
 }

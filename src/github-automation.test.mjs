@@ -5,9 +5,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseRepoConfigText } from './github-config.mjs';
 import { createMemoryGithubClient } from './github-client.mjs';
-import { decideTrigger, recordCiResult, readGithubCiStatus, runIssueAutomation, simulateGithubAutomation, CI_STATUS } from './github-automation.mjs';
+import {
+  decideTrigger,
+  recordCiResult,
+  readGithubCiStatus,
+  runIssueAutomation,
+  simulateGithubAutomation,
+  CI_STATUS,
+  assertRequiredReviewRoute,
+  diagnoseImplementationGateFailure,
+  REQUIRED_REVIEW_NEEDS_TEAM,
+} from './github-automation.mjs';
 import { acquireIssueLock, loadIssueState, saveIssueState, emptyState } from './github-state.mjs';
-import { TRIGGER_LABEL, STOP_LABEL } from './github-labels.mjs';
+import { TRIGGER_LABEL, STOP_LABEL, RoutingConflictError } from './github-labels.mjs';
 import { authorizeAiAutoTrigger } from './github-auth.mjs';
 
 const assisted = parseRepoConfigText(`
@@ -17,6 +27,17 @@ automation:
   max_fix_attempts: 5
 review:
   required: false
+`);
+
+const reviewRequired = parseRepoConfigText(`
+automation:
+  enabled: true
+  mode: assisted
+  max_fix_attempts: 5
+tests:
+  required: true
+review:
+  required: true
 `);
 
 const manual = parseRepoConfigText(`
@@ -1147,6 +1168,211 @@ test('WAITING_FOR_CI resume with Node tests Check API envelope becomes READY_FOR
     const saved = await loadIssueState('owner/app', 6, env);
     assert.equal(saved.githubCi, 'PASS');
     assert.equal(saved.stage, 'READY_FOR_HUMAN_MERGE');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('assertRequiredReviewRoute rejects AUTO and solo; allows TEAM', () => {
+  assert.throws(
+    () => assertRequiredReviewRoute(reviewRequired, { worker: 'AUTO' }),
+    (e) => e instanceof RoutingConflictError && e.message === REQUIRED_REVIEW_NEEDS_TEAM,
+  );
+  assert.throws(
+    () => assertRequiredReviewRoute(reviewRequired, { worker: 'CODEX' }),
+    (e) => e instanceof RoutingConflictError && /TEAM route/.test(e.message),
+  );
+  assert.doesNotThrow(() => assertRequiredReviewRoute(reviewRequired, { worker: 'TEAM' }));
+  assert.doesNotThrow(() => assertRequiredReviewRoute(assisted, { worker: 'AUTO' }));
+});
+
+test('diagnoseImplementationGateFailure never blames local tests when they PASS', () => {
+  assert.equal(
+    diagnoseImplementationGateFailure(
+      { ok: true, tests: 'PASS', review: 'SKIP' },
+      reviewRequired,
+    ),
+    'required AI review did not pass',
+  );
+  assert.equal(
+    diagnoseImplementationGateFailure(
+      { ok: false, tests: 'PASS', review: 'PASS' },
+      reviewRequired,
+    ),
+    'implementation failed',
+  );
+  assert.equal(
+    diagnoseImplementationGateFailure(
+      { ok: false, tests: 'FAIL', review: 'PASS' },
+      reviewRequired,
+    ),
+    'local tests failed',
+  );
+});
+
+test('review.required=true + AUTO route conflicts before runImplementation', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue({ labels: [TRIGGER_LABEL] }));
+  let implCalls = 0;
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: reviewRequired,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        return { ok: true, tests: 'PASS', review: 'PASS', commit: 'x', branch: 'ai/x' };
+      },
+    });
+    assert.equal(result.conflict, true);
+    assert.equal(result.code, 2);
+    assert.equal(implCalls, 0);
+    assert.equal(result.state.stage, 'CONFLICT');
+    assert.match(result.state.lastFailure, /review\.required=true requires the TEAM route/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('review.required=true + explicit CODEX route conflicts before runImplementation', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue({ labels: [TRIGGER_LABEL, 'ai-codex'] }));
+  let implCalls = 0;
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: reviewRequired,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        return { ok: true, tests: 'PASS', review: 'PASS', commit: 'x', branch: 'ai/x' };
+      },
+    });
+    assert.equal(result.conflict, true);
+    assert.equal(implCalls, 0);
+    assert.equal(result.state.stage, 'CONFLICT');
+    assert.match(String(result.state.lastFailure), /solo runs do not produce/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('review.required=true + TEAM is allowed to proceed', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue({ labels: [TRIGGER_LABEL, 'ai-team'] }));
+  let implCalls = 0;
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: reviewRequired,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch }) => {
+        implCalls += 1;
+        return {
+          ok: true,
+          tests: 'PASS',
+          review: 'PASS',
+          commit: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          branch,
+          route: 'TEAM',
+        };
+      },
+      gitPush: async () => ({ ok: true, sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }),
+      waitForCi: async () => ({ status: CI_STATUS.PASS, summary: 'ok' }),
+    });
+    assert.equal(result.conflict, undefined);
+    assert.equal(implCalls, 1);
+    assert.equal(result.state.localTests, 'PASS');
+    assert.equal(result.state.review, 'PASS');
+    assert.ok(['WAITING_FOR_CI', 'READY_FOR_HUMAN_MERGE', 'LOCAL_TESTS'].includes(result.state.stage)
+      || result.state.prNumber);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('review.required=false + ai-auto only keeps smart routing valid', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue({ labels: [TRIGGER_LABEL] }));
+  let implCalls = 0;
+  let seenWorker = '';
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch, routing }) => {
+        implCalls += 1;
+        seenWorker = routing?.worker || '';
+        return {
+          ok: true,
+          tests: 'PASS',
+          review: 'SKIP',
+          commit: 'cccccccccccccccccccccccccccccccccccccccc',
+          branch,
+          route: routing?.worker || 'AUTO',
+        };
+      },
+      gitPush: async () => ({ ok: true, sha: 'cccccccccccccccccccccccccccccccccccccccc' }),
+      waitForCi: async () => ({ status: CI_STATUS.PASS, summary: 'ok' }),
+    });
+    assert.equal(result.conflict, undefined);
+    assert.equal(implCalls, 1);
+    assert.equal(seenWorker, 'AUTO');
+    assert.equal(result.state.localTests, 'PASS');
+    assert.equal(result.state.review, 'SKIP');
+    assert.notEqual(result.state.lastFailure, 'local tests failed');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('localTests PASS + review SKIP never records local tests failed', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  // TEAM satisfies the fail-fast route gate; SKIP review still fails the review gate.
+  const client = createMemoryGithubClient(seedIssue({ labels: [TRIGGER_LABEL, 'ai-team'] }));
+  let implCalls = 0;
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: reviewRequired,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch }) => {
+        implCalls += 1;
+        return {
+          ok: true,
+          tests: 'PASS',
+          review: 'SKIP',
+          commit: 'dddddddddddddddddddddddddddddddddddddddd',
+          branch,
+        };
+      },
+      gitPush: async () => {
+        throw new Error('must not push when required review did not pass');
+      },
+    });
+    assert.equal(implCalls, 1);
+    assert.equal(result.code, 1);
+    assert.equal(result.state.stage, 'FAILED');
+    assert.equal(result.state.localTests, 'PASS');
+    assert.equal(result.state.review, 'SKIP');
+    assert.equal(result.state.lastFailure, 'required AI review did not pass');
+    assert.notEqual(result.state.lastFailure, 'local tests failed');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

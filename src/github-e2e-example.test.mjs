@@ -27,6 +27,9 @@ test('example automation YAML is assisted and never auto-merges', () => {
   assert.equal(c.pull_request.auto_merge, false);
   assert.equal(c.publish.enabled, false);
   assert.equal(c.automation.max_fix_attempts, 5);
+  // First smart-routing smoke uses ai-auto alone; required review would force TEAM.
+  assert.equal(c.review.required, false);
+  assert.equal(c.tests.required, true);
 });
 
 test('label setup catalog includes required live-test labels', () => {

@@ -39,6 +39,8 @@ test('simulate fixture command', async () => {
 automation:
   enabled: true
   mode: assisted
+review:
+  required: false
 `);
   await writeFile(file, JSON.stringify({
     config,

@@ -2,7 +2,7 @@
 
 **Optional:** local `run`, Cursor commands, history, memory, queue and measured routing work without this module. New users can start with [START-HERE.md](START-HERE.md) or [START-HERE-FA.md](START-HERE-FA.md).
 
-Development-branch changes: required tests/review accept only PASS, including on resume; SKIP and UNKNOWN do not pass required gates. Choose TEAM if independent AI review is required. A solo coding run has review SKIP. CI Check Runs and commit statuses are combined, and reads paginate. A failed resumed CI observation enters the bounded fix loop when automation is enabled. Run live commands from the matching target checkout; new Issue runs require its HEAD to match the fetched remote default branch. [Details and crash recovery](LOCAL-MODULES.md).
+Development-branch changes: required tests/review accept only PASS, including on resume; SKIP and UNKNOWN do not pass required gates. Choose TEAM if independent AI review is required. A solo coding run has review SKIP. When `review.required: true`, Issue automation rejects AUTO and solo routes (`ai-codex`, `ai-cursor`, `ai-gemini`, model labels) **before** workers run; use `ai-auto` **and** `ai-team`. When `review.required: false`, `ai-auto` alone may smart-route to a solo worker. Gate failures are diagnosed separately (implementation failed / local tests failed / required AI review did not pass); a PASS local-test result is never recorded as “local tests failed”. CI Check Runs and commit statuses are combined, and reads paginate. A failed resumed CI observation enters the bounded fix loop when automation is enabled. Run live commands from the matching target checkout; new Issue runs require its HEAD to match the fetched remote default branch. [Details and crash recovery](LOCAL-MODULES.md).
 
 Install the reviewed orchestrator revision on the runner before testing; the workflow invokes its installed global CLI. Upgrading the repository checkout alone does not upgrade that installation. Native worktrees and filtered subprocess environments are not a container sandbox.
 
@@ -25,6 +25,16 @@ Default mode is **manual**. Nothing Issue-related runs until you enable a reposi
 3. Automation may start.
 4. Removing `ai-auto` prevents **new** runs where practical.
 5. `ai-stop` cancels after the current safe boundary (no new worker, no extra fix push).
+
+## Review policy vs routing
+
+| Config | Labels | Behavior |
+| --- | --- | --- |
+| `review.required: false` | `ai-auto` only | Smart routing may choose CODEX/CURSOR/etc. Solo runs set `review: SKIP` and may still proceed to PR + CI. |
+| `review.required: true` | `ai-auto` + `ai-team` | TEAM runs and can produce an independent AI review. |
+| `review.required: true` | `ai-auto` alone, or solo/model labels (`ai-codex`, `ai-codex-sol`, `ai-cursor`, `ai-gemini`, …) | **Policy conflict before workers.** No implementation spend. Human review label / CONFLICT. Explicit manual routes are not silently overridden. |
+
+The first live smoke test uses `review.required: false` so `ai-auto`-only smart routing can complete. Optionally add a second smoke Issue with `review.required: true` and labels `ai-auto` + `ai-team` to exercise required review.
 
 ## Attempt limits
 
@@ -127,6 +137,6 @@ Workflow security: hosted `authorize` job (collaborator permission) **then** sel
 4. Copy example config/workflows from `examples/github-e2e-test`.
 5. `ai-orchestrator github labels setup --repo OWNER/ai-orchestrator-e2e-test`
 6. Create Issue without `ai-auto`.
-7. Maintainer adds `ai-auto`.
+7. Maintainer adds `ai-auto` only (example config has `review.required: false` for this smart-routing smoke).
 8. Watch branch/PR/CI.
 9. Merge manually after READY.

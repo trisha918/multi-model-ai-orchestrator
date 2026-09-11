@@ -209,6 +209,10 @@ Record the Issue number. This proves a normal Issue does not start automation.
 
 ## Test 2 — trusted `ai-auto` (smart routing)
 
+The example `.github/ai-orchestrator.yml` sets **`review.required: false`** so this first smoke can validate smart routing with `ai-auto` alone. Solo workers (CODEX/CURSOR/…) return `review: SKIP` and still proceed to PR + CI.
+
+If you set `review.required: true`, do **not** use `ai-auto` alone: automation fails closed before workers and requires `ai-auto` + `ai-team`. See [AUTOMATION.md](AUTOMATION.md) (Review policy vs routing).
+
 As a maintainer, add **only** `ai-auto` (no `ai-codex` / model labels).
 
 Expected:
@@ -217,13 +221,16 @@ Expected:
 2. Self-hosted job starts.
 3. Comment: AI Automation — Started (AUTO worker, AUTO model).
 4. Branch `ai/issue-<n>-add-multiply-operation-and-tests` (slug may vary).
-5. Local tests PASS.
+5. Local tests PASS (`review` may be SKIP on a solo route).
 6. PR opened, GitHub `ci.yml` runs on the PR (hosted Windows).
-7. AI review if required.
-8. Label `ai-ready-to-merge`.
-9. PR remains **OPEN**. Not merged.
+7. Label `ai-ready-to-merge`.
+8. PR remains **OPEN**. Not merged.
 
 Record: workflow run id, issue number, route, models, branch, PR number.
+
+### Optional — required-review TEAM smoke
+
+Copy or edit config with `review.required: true`, then open a separate Issue and apply **`ai-auto` and `ai-team`**. Solo/AUTO-only labels must conflict before workers. Expected: TEAM implementation, independent review PASS, then PR + CI as usual.
 
 ```powershell
 ai-orchestrator github status --repo YOUR_LOGIN/ai-orchestrator-e2e-test --issue N

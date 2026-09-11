@@ -155,6 +155,48 @@ function applyImplementationResult(state, result, config) {
   state.branchPushed = false;
 }
 
+export const REQUIRED_REVIEW_NEEDS_TEAM =
+  'review.required=true requires the TEAM route (ai-team) because solo runs do not produce an independent AI review.';
+
+/**
+ * Fail closed before workers when required independent review cannot be produced.
+ * AUTO and solo routes (CURSOR/CODEX/GEMINI) are incompatible with review.required.
+ */
+export function assertRequiredReviewRoute(config, routing) {
+  if (!config?.review?.required) return;
+  const worker = String(routing?.worker || 'AUTO').toUpperCase();
+  if (worker === 'TEAM') return;
+  throw new RoutingConflictError(REQUIRED_REVIEW_NEEDS_TEAM, {
+    worker,
+    required: 'TEAM',
+  });
+}
+
+/**
+ * Distinguish implementation / local-test / required-review gate failures.
+ * Never report "local tests failed" when tests are PASS.
+ */
+export function diagnoseImplementationGateFailure(result, config) {
+  const tests = result?.tests;
+  const review = result?.review;
+  const testsRequired = Boolean(config?.tests?.required);
+  const reviewRequired = Boolean(config?.review?.required);
+
+  if (testsRequired && (tests === 'FAIL' || tests === 'TIMEOUT')) {
+    return 'local tests failed';
+  }
+  if (result?.ok !== true) {
+    return 'implementation failed';
+  }
+  if (testsRequired && tests !== 'PASS') {
+    return 'local tests failed';
+  }
+  if (reviewRequired && review !== 'PASS') {
+    return 'required AI review did not pass';
+  }
+  return '';
+}
+
 /**
  * Resume past implementation when local work already completed.
  * UNKNOWN review must not re-run workers when review is not required.
@@ -532,6 +574,49 @@ export async function runIssueAutomation({
       resumeWaitingForCi,
     });
 
+    // Missing required review always stops on LOCAL_TESTS resume (before route policy /
+    // workers). FAILED required tests only stop here when workers are already skipped
+    // (e.g. PR exists); otherwise implementRound recovers.
+    const resumeMissingRequiredGate = decision.action === 'resume'
+      && state.stage === 'LOCAL_TESTS'
+      && (
+        (config.review.required && state.review !== 'PASS')
+        || (skipImplementation && config.tests.required && state.localTests !== 'PASS')
+      );
+    if (resumeMissingRequiredGate) {
+      applyStage(state, 'HUMAN_REVIEW_REQUIRED');
+      state.lastDiagnosis = 'Required local tests or AI review did not pass';
+      if (!dryRun) state = await saveIssueState(state, env);
+      await emit('human_review_required', state.lastDiagnosis, state.stage);
+      await applyLabels(client, { owner, name, issueNumber, issue, stage: state.stage, dryRun, plan });
+      return done({ code: 1, plan, state, decision });
+    }
+
+    // Fail before workers when required review cannot be produced by the resolved route.
+    // Resume paths that skip implementation (PR/CI already in progress) are left alone.
+    if (!skipImplementation) {
+      try {
+        assertRequiredReviewRoute(config, routing);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        applyStage(state, 'CONFLICT');
+        state.lastFailure = msg;
+        state.lastDiagnosis = msg;
+        state.route = routing?.worker || state.route;
+        state.model = routing?.selection === 'MANUAL' ? routing.model : (state.model || 'AUTO');
+        if (!dryRun) state = await saveIssueState(state, env);
+        const body = formatStatusComment({
+          headline: MILESTONE_HEADLINES.HUMAN_REVIEW_REQUIRED,
+          diagnosis: msg,
+          route: state.route,
+          model: state.model,
+        });
+        await upsertStatus(client, { owner, name, issueNumber, state, body, dryRun, plan });
+        await applyLabels(client, { owner, name, issueNumber, issue, stage: 'CONFLICT', dryRun, plan });
+        return done({ code: 2, conflict: true, decision, plan, state });
+      }
+    }
+
     if (decision.action !== 'resume' || !state.mode) state.mode = config.automation.mode;
     state.maxAttempts = config.automation.max_fix_attempts || state.maxAttempts;
     state.route = routing.worker;
@@ -597,12 +682,13 @@ export async function runIssueAutomation({
         env,
       });
       applyImplementationResult(state, result, config);
-      const failed = result?.ok !== true || (config.tests.required && result.tests !== 'PASS') || (config.review.required && result.review !== 'PASS');
+      const failureReason = diagnoseImplementationGateFailure(result, config);
+      const failed = Boolean(failureReason);
       if (!failed) applyStage(state, 'LOCAL_TESTS');
       state = await saveIssueState(state, env);
       await emit('implementation_completed', failed ? 'FAIL' : 'PASS', state.stage);
       await emit('local_tests_completed', state.localTests || (failed ? 'FAIL' : 'PASS'), state.stage);
-      return { failed, result };
+      return { failed, result, failureReason };
     }
 
     async function findExistingPullRequest() {
@@ -684,20 +770,7 @@ export async function runIssueAutomation({
     // Missing required review always stops on LOCAL_TESTS resume.
     // FAILED required tests only stop here when workers are already skipped
     // (e.g. PR exists); otherwise implementRound recovers.
-    const resumeMissingRequiredGate = decision.action === 'resume'
-      && state.stage === 'LOCAL_TESTS'
-      && (
-        (config.review.required && state.review !== 'PASS')
-        || (skipImplementation && config.tests.required && state.localTests !== 'PASS')
-      );
-    if (resumeMissingRequiredGate) {
-      applyStage(state, 'HUMAN_REVIEW_REQUIRED');
-      state.lastDiagnosis = 'Required local tests or AI review did not pass';
-      state = await saveIssueState(state, env);
-      await emit('human_review_required', state.lastDiagnosis, state.stage);
-      await applyLabels(client, { owner, name, issueNumber, issue, stage: state.stage, dryRun, plan });
-      return done({ code: 1, plan, state, decision });
-    }
+    // (Handled earlier, before required-review route policy, so resume does not CONFLICT.)
 
     if (!skipImplementation) {
       const first = await implementRound();
@@ -708,7 +781,13 @@ export async function runIssueAutomation({
       }
       if (first.failed) {
         applyStage(state, 'FAILED');
-        state.lastFailure = 'local tests failed';
+        const reason = first.failureReason
+          || diagnoseImplementationGateFailure(first.result, config)
+          || 'implementation failed';
+        // Never claim local tests failed when they actually passed.
+        state.lastFailure = (reason === 'local tests failed' && state.localTests === 'PASS')
+          ? 'required AI review did not pass'
+          : reason;
         state = await saveIssueState(state, env);
         await applyLabels(client, { owner, name, issueNumber, issue, stage: 'FAILED', dryRun, plan });
         return done({ code: 1, plan, state });

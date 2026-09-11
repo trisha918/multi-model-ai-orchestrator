@@ -13,7 +13,7 @@ tests:
   required: true
 
 review:
-  required: true
+  required: false
 
 publish:
   enabled: false
