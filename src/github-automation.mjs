@@ -312,7 +312,15 @@ export async function inspectIssueAutomation({
   };
 }
 
-export async function runIssueAutomation({
+export async function runIssueAutomation(options = {}) {
+  const { repo, issueNumber, env = process.env, dryRun } = options;
+  const lock = dryRun ? { ok: true } : await acquireIssueLock(repo, issueNumber, env);
+  if (!lock.ok) return { code: 2, skipped: true, decision: { action: 'busy', reason: lock.reason } };
+  try { return await runIssueAutomationLocked(options); }
+  finally { if (!dryRun) await releaseIssueLock(repo, issueNumber, env); }
+}
+
+async function runIssueAutomationLocked({
   client,
   config,
   repo,
@@ -370,11 +378,6 @@ export async function runIssueAutomation({
     await upsertStatus(client, { owner, name, issueNumber, state, body, dryRun, plan });
     await applyLabels(client, { owner, name, issueNumber, issue, stage: 'CONFLICT', dryRun, plan });
     return { code: 2, conflict: true, decision, plan, state };
-  }
-
-  const lock = dryRun ? { ok: true } : await acquireIssueLock(slug, issueNumber, env);
-  if (!lock.ok) {
-    return { code: 2, skipped: true, decision: { action: 'busy', reason: lock.reason }, plan, state: inspected.state };
   }
 
   try {
@@ -478,7 +481,7 @@ export async function runIssueAutomation({
         env,
       });
       applyImplementationResult(state, result, config);
-      const failed = result.ok === false || (config.tests.required && result.tests === 'FAIL');
+      const failed = result?.ok !== true || (config.tests.required && result.tests !== 'PASS') || (config.review.required && result.review !== 'PASS');
       if (!failed) state.stage = 'LOCAL_TESTS';
       state = await saveIssueState(state, env);
       return { failed, result };
@@ -499,15 +502,13 @@ export async function runIssueAutomation({
       const existing = await findExistingPullRequest();
       if (existing?.number) {
         state.prNumber = existing.number;
-        state.unsafePushPending = false;
         state = await saveIssueState(state, env);
-        return { crashed: false };
       }
       if (!skipPush && typeof gitPush === 'function') {
         state.unsafePushPending = true;
         state = await saveIssueState(state, env);
         try {
-          const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
+          const pushed = await gitPush({ branch: state.branch, repo: localRepo, expectedSha: state.commitSha, repository: slug, force: false });
           rememberPushedSha(state, pushed);
           state.unsafePushPending = false;
           state = await saveIssueState(state, env);
@@ -563,57 +564,42 @@ export async function runIssueAutomation({
       }
     }
 
+    if (!state.prNumber && ((config.tests.required && state.localTests !== 'PASS') || (config.review.required && state.review !== 'PASS'))) {
+      state.stage = 'HUMAN_REVIEW_REQUIRED';
+      state.lastDiagnosis = 'Required local verification is missing; refusing push and PR creation';
+      state = await saveIssueState(state, env);
+      await applyLabels(client, { owner, name, issueNumber, issue, stage: state.stage, dryRun, plan });
+      return { code: 2, plan, state, decision };
+    }
     if (!state.prNumber && (state.localTests === 'PASS' || state.localTests === 'SKIP')) {
       const pushed = await pushBranchAndOpenPr({ skipGitPush });
       if (pushed.crashed) {
         return { code: 1, crashed: true, plan, state };
       }
     }
-    if (resumeWaitingForCi) {
-      const sync = await readGithubCiStatus({ client, owner, name, state });
-      state.githubCi = sync.githubCi;
-      state.stage = sync.stage;
-      if (sync.githubCi === 'FAIL') state.lastFailure = sync.summary || 'GitHub CI failed';
-      if (sync.githubCi === 'PASS') {
-        state.lastFailure = '';
-        state.pullRequestAutoMerged = false;
-        state.published = false;
-      }
-      state = await saveIssueState(state, env);
-      await applyLabels(client, { owner, name, issueNumber, issue, stage: state.stage, dryRun, plan });
-      if (state.stage === 'READY_FOR_HUMAN_MERGE') {
-        state = await upsertStatus(client, {
-          owner, name, issueNumber, state, dryRun, plan,
-          body: formatStatusComment({
-            headline: MILESTONE_HEADLINES.READY_FOR_HUMAN_MERGE,
-            localTests: state.localTests,
-            githubCi: 'PASS',
-            review: state.review || 'PASS',
-            attempt: state.attempt,
-            maxAttempts: state.maxAttempts,
-          }),
-        });
-        state = await saveIssueState(state, env);
-      }
-      return {
-        code: state.stage === 'FAILED' ? 1 : 0,
-        plan,
-        state,
-        decision,
-        waiting: state.stage === 'WAITING_FOR_CI',
-      };
-    }
-
     state.stage = 'WAITING_FOR_CI';
+    state.ciStartedAt ||= new Date().toISOString();
     await applyLabels(client, { owner, name, issueNumber, issue, stage: 'WAITING_FOR_CI', dryRun, plan });
     state = await saveIssueState(state, env);
 
-    const poll = typeof waitForCi === 'function'
+    let firstResumePoll = resumeWaitingForCi;
+    const normalPoll = typeof waitForCi === 'function'
       ? waitForCi
       : async ({ ref }) => {
         const runs = await fetchGithubCiRuns(client, owner, name, ref);
-        return classifyCheckRuns(runs, { timeoutMs: ciTimeoutMs, startedAt: state.updatedAt });
+        return classifyCheckRuns(runs, { timeoutMs: ciTimeoutMs, startedAt: state.ciStartedAt });
       };
+    const poll = async ({ ref, state: current }) => {
+      if (firstResumePoll) {
+        firstResumePoll = false;
+        if (current.prNumber && typeof client.getPullRequest === 'function') {
+          const pr = await client.getPullRequest(owner, name, current.prNumber);
+          if (pr?.head?.sha && pr.head.sha !== current.commitSha) throw new Error('PR head changed since local verification; inspect and re-run verification');
+        }
+        return classifyCheckRuns(await fetchGithubCiRuns(client, owner, name, ref), { timeoutMs: ciTimeoutMs, startedAt: current.ciStartedAt });
+      }
+      return normalPoll({ ref, state: current });
+    };
 
     while (state.stage === 'WAITING_FOR_CI' || state.stage === 'FIXING') {
       const namesNow = (await client.getLabels(owner, name, issueNumber)).map(l => l.name || l);
@@ -622,6 +608,11 @@ export async function runIssueAutomation({
         break;
       }
       if (state.stage === 'FIXING') {
+        if (!isIssueAutomationActive(config)) {
+          state.stage = 'HUMAN_REVIEW_REQUIRED';
+          state.lastDiagnosis = 'CI failed; enable automation in this repository before requesting more AI work';
+          break;
+        }
         const logs = state.lastCiRun;
         const fixContext = collectCiFailureContext({
           issueTask: taskCtx.task,
@@ -658,7 +649,7 @@ export async function runIssueAutomation({
           state.unsafePushPending = true;
           state = await saveIssueState(state, env);
           try {
-            const pushed = await gitPush({ branch: state.branch, repo: localRepo, force: false });
+            const pushed = await gitPush({ branch: state.branch, repo: localRepo, expectedSha: state.commitSha, repository: slug, force: false });
             rememberPushedSha(state, pushed);
             state.unsafePushPending = false;
           } catch (e) {
@@ -677,6 +668,7 @@ export async function runIssueAutomation({
           }),
         });
         state.stage = 'WAITING_FOR_CI';
+        state.ciStartedAt = new Date().toISOString();
         await applyLabels(client, { owner, name, issueNumber, issue, stage: 'WAITING_FOR_CI', dryRun, plan });
         state = await saveIssueState(state, env);
       }
@@ -691,7 +683,7 @@ export async function runIssueAutomation({
       }
       state = recordCiResult(state, status);
       if (ci && typeof ci === 'object') {
-        state.lastFailure = redactCiText(ci.summary || status);
+        state.lastFailure = status === CI_STATUS.PASS ? '' : redactCiText(ci.summary || status);
         if (ci.logs) {
           try {
             const dirs = runtimeDirs(env);
@@ -704,8 +696,8 @@ export async function runIssueAutomation({
         }
       }
       if (state.stage === 'READY_FOR_HUMAN_MERGE') {
-        const reviewOk = !config.review.required || state.review === 'PASS' || state.review === 'SKIP';
-        const testsOk = !config.tests.required || state.localTests === 'PASS' || state.localTests === 'SKIP';
+        const reviewOk = !config.review.required || state.review === 'PASS';
+        const testsOk = !config.tests.required || state.localTests === 'PASS';
         if (!reviewOk || !testsOk) {
           state.stage = 'HUMAN_REVIEW_REQUIRED';
           state.lastDiagnosis = 'GitHub CI passed but required local tests or AI review did not pass';
@@ -752,9 +744,7 @@ export async function runIssueAutomation({
     state.published = false;
     state = await saveIssueState(state, env);
     return { code: state.stage === 'READY_FOR_HUMAN_MERGE' ? 0 : 1, plan, state, decision };
-  } finally {
-    if (!dryRun) await releaseIssueLock(slug, issueNumber, env);
-  }
+  } catch (error) { throw error; }
 }
 
 export async function resumeIssueAutomation(options) {

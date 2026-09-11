@@ -41,12 +41,16 @@ export function planCleanup({ olderThanDays = 7, now = Date.now(), root, env = p
 
   for (const dirs of pairs) {
     for (const [kind, base] of [['runs', dirs.runs], ['worktrees', dirs.worktrees]]) {
-      void kind;
+
       if (!existsSync(base)) continue;
       for (const entry of readdirSync(base, { withFileTypes: true })) {
         if (!entry.isDirectory() || !isOrchestratorArtifactName(entry.name)) continue;
         const folder = path.join(base, entry.name);
         if (!isInsideDir(base, folder)) continue;
+        if (kind === 'worktrees' || existsSync(path.join(dirs.worktrees, entry.name)) || existsSync(path.join(folder, 'active.lock'))) {
+          candidates.push({ path: folder, action: 'keep', reason: 'worktree or active run; inspect and remove with Git explicitly', rootKind: dirs.label });
+          continue;
+        }
         let mtime = 0;
         try { mtime = statSync(folder).mtimeMs; } catch { continue; }
         if (mtime > cutoff) candidates.push({ path: folder, action: 'keep', reason: 'newer than cutoff', rootKind: dirs.label });
@@ -86,6 +90,11 @@ export function applyCleanup(plan, { apply = false, root, env = process.env } = 
       preserved.push({ ...item, action: 'keep', reason: 'outside managed roots' });
       continue;
     }
+    // Re-check at apply time; plans may be stale or supplied by another caller.
+    const protectedPath = path.basename(path.dirname(item.path)) === 'worktrees'
+      || existsSync(path.join(item.path, 'active.lock'))
+      || existsSync(path.join(path.dirname(path.dirname(item.path)), 'worktrees', path.basename(item.path)));
+    if (protectedPath) { preserved.push({ ...item, action: 'keep', reason: 'active run or retained worktree' }); continue; }
     rmSync(item.path, { recursive: true, force: true });
     removed.push(item);
   }

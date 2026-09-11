@@ -1,4 +1,5 @@
-import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { validateImplementationOutput } from './run-controls.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { runProcess, findOnPath } from './tooling.mjs';
@@ -10,67 +11,13 @@ import { inspectIssueAutomation, runIssueAutomation, simulateGithubAutomation, i
 import { formatGithubStatus } from './github-pr.mjs';
 import { classifyCheckRuns, CI_STATUS, fetchGithubCiRuns } from './github-ci.mjs';
 import { runTask } from './orchestrator.mjs';
-import { git } from './workspace.mjs';
+import { git, resolveGitRootFromCwd } from './workspace.mjs';
 import { collectGithubDoctor, formatGithubDoctor } from './github-doctor.mjs';
 import { formatGithubRepoDoctor, probeGithubRepo } from './github-probe.mjs';
 import { detectGithubAuth } from './github-client.mjs';
 
-export function parseGithubCli(argv) {
-  const args = [...argv];
-  const out = {
-    command: 'github',
-    subcommand: args[0] || '',
-    repo: '',
-    issue: '',
-    dryRun: false,
-    fixture: '',
-    help: false,
-  };
-  if (args[0] === 'issue' && (args[1] === 'run' || args[1] === 'inspect')) {
-    out.subcommand = `issue ${args[1]}`;
-    parseFlags(args.slice(2), out);
-  } else if (args[0] === 'labels' && args[1] === 'setup') {
-    out.subcommand = 'labels setup';
-    parseFlags(args.slice(2), out);
-  } else if (args[0] === 'status' || args[0] === 'resume' || args[0] === 'simulate' || args[0] === 'doctor' || args[0] === 'authorize') {
-    out.subcommand = args[0];
-    parseFlags(args.slice(1), out);
-  } else if (args[0] === '--help' || args[0] === '-h' || !args[0]) {
-    out.help = true;
-  } else {
-    out.error = `Unknown github subcommand: ${args.join(' ')}`;
-  }
-  return out;
-}
-
-function parseFlags(args, out) {
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--repo') out.repo = args[++i] ?? '';
-    else if (a === '--issue') out.issue = args[++i] ?? '';
-    else if (a === '--dry-run') out.dryRun = true;
-    else if (a === '--fixture') out.fixture = args[++i] ?? '';
-    else if (a === '--help' || a === '-h') out.help = true;
-  }
-}
-
-export function githubHelpText() {
-  return [
-    'GitHub automation (optional, default off):',
-    '',
-    '  ai-orchestrator github issue run --repo owner/name --issue 42 [--dry-run]',
-    '  ai-orchestrator github issue inspect --repo owner/name --issue 42',
-    '  ai-orchestrator github labels setup --repo owner/name [--dry-run]',
-    '  ai-orchestrator github status --repo owner/name --issue 42',
-    '  ai-orchestrator github authorize --repo owner/name --issue 42',
-    '  ai-orchestrator github doctor [--repo owner/name]',
-    '  ai-orchestrator github resume --repo owner/name --issue 42 [--dry-run]',
-    '  ai-orchestrator github simulate --fixture path.json',
-    '',
-    'Automation starts only after a trusted actor adds the ai-auto label.',
-    'v1.1 never auto-merges or publishes.',
-  ].join('\n');
-}
+export { parseGithubCli, githubHelpText } from './github-options.mjs';
+import { parseGithubCli, githubHelpText } from './github-options.mjs';
 
 function resolveGhPath() {
   return findOnPath(process.platform === 'win32' ? ['gh.exe', 'gh.cmd'] : ['gh']) || '';
@@ -92,41 +39,48 @@ export async function defaultRunImplementation({
   task,
   routing,
   env,
+  state,
   runTaskImpl = runTask,
   gitImpl = git,
 } = {}) {
+  if (state?.repository) await verifyGithubCheckout(repo, state.repository);
   const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-task-'));
   const taskFile = path.join(dir, 'task.txt');
   await writeFile(taskFile, task, { encoding: 'utf8' });
   const argv = implementationArgv({ repo, branch, taskFile, routing });
-  const code = await runTaskImpl(argv, { env });
-  const numeric = code === 0 ? 0 : (Number.isInteger(code) ? code : 1);
-  let hash = '';
+  let result;
   try {
-    hash = await gitImpl(repo, ['rev-parse', branch]);
-  } catch {
-    hash = '';
+    const code = await runTaskImpl(argv, { env, resume: { expectedSha: state?.commitSha }, onResult: value => { result = value; } });
+    if (code !== 0 || !result) return { ...result, ok: false, tests: result?.tests || 'UNKNOWN', review: result?.review || 'UNKNOWN', error: 'Implementation did not supply a successful structured result' };
+    const sha = await gitImpl(repo, ['rev-parse', branch]);
+    validateImplementationOutput(result, { branch, sha, testsRequired: false, reviewRequired: false });
+    return result;
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
-  return {
-    ok: numeric === 0,
-    tests: numeric === 0 ? 'PASS' : 'FAIL',
-    review: 'PASS',
-    commit: hash,
-    branch,
-    route: routing.worker,
-    model: routing.model,
-  };
 }
 
-export async function defaultGitPush({ branch, repo }) {
+export async function verifyGithubCheckout(repo, slug) {
+  const root = await resolveGitRootFromCwd(repo);
+  const remote = await git(root, ['remote', 'get-url', 'origin']);
+  const parsed = remote.replace(/^git@github\.com:/i, '').replace(/^https:\/\/github\.com\//i, '').replace(/\.git$/, '');
+  if (parsed.toLowerCase() !== slug.toLowerCase()) throw new Error('Local origin does not match --repo. Run this command from the target repository checkout.');
+  return root;
+}
+
+export async function defaultGitPush({ branch, repo, expectedSha, repository }) {
   if (!repo) throw new Error('Missing local repository for git push');
-  await git(repo, ['push', '-u', 'origin', branch]);
+  await verifyGithubCheckout(repo, repository);
+  const before = await git(repo, ['rev-parse', `refs/heads/${branch}`]);
+  if (!expectedSha || before !== expectedSha) throw new Error('Branch changed after verification; refusing push');
+  await git(repo, ['push', '-u', 'origin', `refs/heads/${branch}:refs/heads/${branch}`]);
   const sha = await git(repo, ['rev-parse', branch]);
   return { sha };
 }
 
-export async function waitForGithubCi({ client, owner, name, ref, timeoutMs = 60 * 60 * 1000 }) {
-  const started = Date.now();
+export async function waitForGithubCi({ client, owner, name, ref, timeoutMs = 60 * 60 * 1000, startedAt }) {
+  const parsedStart = Date.parse(startedAt || '');
+  const started = Number.isFinite(parsedStart) ? parsedStart : Date.now();
   while (Date.now() - started < timeoutMs) {
     const runs = await fetchGithubCiRuns(client, owner, name, ref);
     const classified = classifyCheckRuns(runs, { now: Date.now(), timeoutMs, startedAt: new Date(started).toISOString() });
@@ -249,6 +203,22 @@ export async function cmdGithub(parsed, {
   }
 
   if (parsed.subcommand === 'issue run' || parsed.subcommand === 'resume') {
+    let localRoot = cwd;
+    let defaultBranch = 'main';
+    if (clientFactory === buildLiveClient && !parsed.dryRun) {
+      localRoot = await verifyGithubCheckout(cwd, slug);
+      const remoteRepo = await client.getRepo(owner, name);
+      defaultBranch = remoteRepo.default_branch;
+      if (!defaultBranch) throw new Error('Cannot determine repository default branch');
+      // New runs must start from the current default branch, never a random checkout.
+      const existing = await import('./github-state.mjs').then(m => m.loadIssueState(slug, issueNumber, env));
+      if (!existing) {
+        await git(localRoot, ['fetch', 'origin', defaultBranch]);
+        const head = await git(localRoot, ['rev-parse', 'HEAD']);
+        const base = await git(localRoot, ['rev-parse', `refs/remotes/origin/${defaultBranch}`]);
+        if (head !== base) throw new Error('Checkout must match origin default branch before starting a new Issue run. Update it and retry.');
+      }
+    }
     const fn = parsed.subcommand === 'resume' ? resumeIssueAutomation : runIssueAutomation;
     const result = await fn({
       client,
@@ -257,12 +227,13 @@ export async function cmdGithub(parsed, {
       issueNumber,
       dryRun: parsed.dryRun,
       env,
-      localRepo: cwd,
+      localRepo: localRoot,
+      defaultBranch,
       runImplementation: parsed.dryRun ? async () => ({ ok: true, tests: 'PASS', review: 'PASS', commit: '', branch: 'dry' }) : runImplementation,
       gitPush: parsed.dryRun ? async () => ({ sha: '' }) : gitPush,
       waitForCi: parsed.dryRun
         ? async () => ({ status: CI_STATUS.PASS, summary: 'dry-run' })
-        : (waitForCi || (async ({ ref }) => waitForGithubCi({ client, owner, name, ref }))),
+        : (waitForCi || (async ({ ref, state }) => waitForGithubCi({ client, owner, name, ref, startedAt: state.ciStartedAt }))),
     });
     if (result.dryRun) {
       stdout('Dry run — no push, PR, comment, or label writes.');

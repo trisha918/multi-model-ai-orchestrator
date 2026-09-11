@@ -66,11 +66,7 @@ export function extractCheckRuns(payload) {
 }
 
 async function safeExtract(load) {
-  try {
-    return extractCheckRuns(await load());
-  } catch {
-    return [];
-  }
+  return extractCheckRuns(await load());
 }
 
 export async function fetchGithubCiRuns(client, owner, name, ref) {
@@ -82,8 +78,8 @@ export async function fetchGithubCiRuns(client, owner, name, ref) {
   if (!runs.length && typeof client.listWorkflowRuns === 'function') {
     runs = await safeExtract(() => client.listWorkflowRuns(owner, name, { headSha: ref }));
   }
-  if (!runs.length && typeof client.getCombinedStatus === 'function') {
-    runs = await safeExtract(() => client.getCombinedStatus(owner, name, ref));
+  if (typeof client.getCombinedStatus === 'function') {
+    runs.push(...await safeExtract(() => client.getCombinedStatus(owner, name, ref)));
   }
   return runs;
 }

@@ -117,7 +117,7 @@ test('github authorize blocks untrusted actors when repo automation is assisted'
   }
 });
 
-test('defaultRunImplementation treats runTask 0 as tests PASS, not FAIL from undefined', async () => {
+test('defaultRunImplementation preserves structured tests and verified branch SHA', async () => {
   const gitArgs = [];
   const impl = await defaultRunImplementation({
     repo: os.tmpdir(),
@@ -125,15 +125,15 @@ test('defaultRunImplementation treats runTask 0 as tests PASS, not FAIL from und
     task: 'implement',
     routing,
     env: {},
-    runTaskImpl: async () => 0,
+    runTaskImpl: async (_argv, { onResult }) => { onResult({ version: 1, ok: true, tests: 'PASS', review: 'SKIP', commit: 'a'.repeat(40), branch: 'ai/issue-1-demo' }); return 0; },
     gitImpl: async (_repo, args) => {
       gitArgs.push(args);
-      return 'impl-sha';
+      return 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
     },
   });
   assert.equal(impl.ok, true);
   assert.equal(impl.tests, 'PASS');
-  assert.equal(impl.commit, 'impl-sha');
+  assert.equal(impl.commit, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
   assert.deepEqual(gitArgs[0], ['rev-parse', 'ai/issue-1-demo']);
   assert.notEqual(gitArgs[0]?.[1], 'HEAD');
 });
@@ -150,7 +150,7 @@ test('defaultRunImplementation does not treat undefined runTask success as ok=tr
   });
   assert.equal(impl.ok === true && impl.tests === 'FAIL', false);
   assert.equal(impl.ok, false);
-  assert.equal(impl.tests, 'FAIL');
+  assert.equal(impl.tests, 'UNKNOWN');
 });
 
 test('defaultRunImplementation reports FAIL for genuine local-test failures', async () => {
@@ -160,12 +160,12 @@ test('defaultRunImplementation reports FAIL for genuine local-test failures', as
     task: 'implement',
     routing,
     env: {},
-    runTaskImpl: async () => 1,
-    gitImpl: async () => 'impl-sha',
+    runTaskImpl: async (_argv, { onResult }) => { onResult({ version: 1, ok: false, tests: 'FAIL', review: 'SKIP', commit: 'a'.repeat(40), branch: 'ai/issue-1-demo' }); return 1; },
+    gitImpl: async () => 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
   });
   assert.equal(impl.ok, false);
   assert.equal(impl.tests, 'FAIL');
-  assert.equal(impl.commit, 'impl-sha');
+  assert.equal(impl.commit, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
 });
 
 test('defaultRunImplementation returns implementation branch SHA, not source HEAD', async () => {
@@ -193,7 +193,7 @@ test('defaultRunImplementation returns implementation branch SHA, not source HEA
       task: 'implement',
       routing,
       env: {},
-      runTaskImpl: async () => 0,
+      runTaskImpl: async (_argv, { onResult }) => { onResult({ version: 1, ok: true, tests: 'PASS', review: 'SKIP', commit: implSha, branch: 'ai/issue-9-impl' }); return 0; },
     });
     assert.equal(impl.commit, implSha);
     assert.notEqual(impl.commit, mainSha);
@@ -244,6 +244,7 @@ review:
       }),
       stage: 'LOCAL_TESTS',
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: implCommit,
       branch: implBranch,
       prNumber: null,
@@ -334,6 +335,7 @@ review:
       prNumber: 7,
       githubCi: 'UNKNOWN',
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: commit,
       branch,
       mode: 'assisted',
@@ -409,6 +411,7 @@ test('github resume updates state file even when cwd automation yaml is disabled
       prNumber: 7,
       githubCi: 'UNKNOWN',
       localTests: 'PASS',
+      review: 'PASS',
       commitSha: commit,
       branch,
       mode: 'assisted',

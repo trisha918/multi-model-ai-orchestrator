@@ -1,9 +1,10 @@
 import { spawnSync } from 'node:child_process';
 import process from 'node:process';
+import { StringDecoder } from 'node:string_decoder';
 import { isWin, spawnCommand } from './tooling.mjs';
 
 function redact(text) {
-  return String(text || '').replace(
+  return String(text || '').replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, '[redacted]').replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(
     /(api[_-]?key|token|authorization|secret|password)\s*[:=]\s*\S+/gi,
     '$1: [redacted]'
   );
@@ -43,9 +44,16 @@ export function executeProcess(command, args, {
   quiet = false,
   env,
   maxRetries = 0,
+  maxOutputBytes = 4 * 1024 * 1024,
 } = {}) {
+  const secrets = Object.entries(env || process.env).filter(([key, value]) => /key|token|password|secret/i.test(key) && String(value).length >= 6).map(([,value]) => String(value));
+  const clean = text => {
+    let value = String(text || '');
+    for (const secret of secrets) value = value.split(secret).join('[redacted]');
+    return redact(value);
+  };
   const attempts = Math.max(0, Number(maxRetries) || 0) + 1;
-  const label = [command, ...(args || [])].join(' ');
+  const label = clean([command, ...(args || [])].join(' '));
 
   async function once(attempt) {
     const started = Date.now();
@@ -71,20 +79,26 @@ export function executeProcess(command, args, {
 
       let stdout = '';
       let stderr = '';
+      const outDecoder = new StringDecoder('utf8');
+      const errDecoder = new StringDecoder('utf8');
       let finished = false;
       let timedOut = false;
+      let outputBytes = 0;
+      let outputLimit = false;
       const timer = setTimeout(() => {
         timedOut = true;
         killProcessTree(child.pid);
       }, timeoutMs);
 
       child.stdout?.on('data', d => {
-        stdout += d.toString();
-        if (!quiet) process.stdout.write(d);
+        outputBytes += d.length;
+        if (outputBytes <= maxOutputBytes) stdout += outDecoder.write(d);
+        else { outputLimit = true; killProcessTree(child.pid); }
       });
       child.stderr?.on('data', d => {
-        stderr += d.toString();
-        if (!quiet) process.stderr.write(d);
+        outputBytes += d.length;
+        if (outputBytes <= maxOutputBytes) stderr += errDecoder.write(d);
+        else { outputLimit = true; killProcessTree(child.pid); }
       });
       child.on('error', err => {
         if (finished) return;
@@ -96,8 +110,8 @@ export function executeProcess(command, args, {
           signal: null,
           timedOut,
           durationMs: Date.now() - started,
-          stdout: redact(stdout),
-          stderr: redact(stderr),
+          stdout: clean(stdout),
+          stderr: clean(stderr),
           spawnError: true,
           error: err.message,
           attempt,
@@ -107,14 +121,18 @@ export function executeProcess(command, args, {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
+        // Redact complete output to handle secrets split across stream chunks.
+        stdout += outDecoder.end(); stderr += errDecoder.end();
+        if (!quiet) { process.stdout.write(clean(stdout)); process.stderr.write(clean(stderr)); }
         resolve({
           command: label,
-          exitCode: code,
+          exitCode: outputLimit ? 1 : code,
+          outputLimit,
           signal,
           timedOut,
           durationMs: Date.now() - started,
-          stdout: redact(stdout),
-          stderr: redact(stderr),
+          stdout: clean(stdout),
+          stderr: clean(stderr),
           spawnError: false,
           attempt,
         });

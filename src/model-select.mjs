@@ -39,6 +39,8 @@ export function pickRequestedModel({ provider, route, args = {}, config = {} }) 
   if (cliId) {
     return { kind: 'id', value: assertSafeModelValue(cliId, { exactId: true }), manual: true, source: 'cli' };
   }
+  if (cliStage && isAutoToken(cliStage)) return { kind: 'auto', value: 'auto', manual: false, source: 'cli' };
+  if (!cliStage && cliModel && isAutoToken(cliModel)) return { kind: 'auto', value: 'auto', manual: false, source: 'cli' };
   if (cliStage && !isAutoToken(cliStage)) {
     return { kind: 'alias', value: assertSafeModelValue(cliStage), manual: true, source: 'cli' };
   }

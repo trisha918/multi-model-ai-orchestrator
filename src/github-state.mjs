@@ -1,3 +1,4 @@
+import { acquireFileLock, releaseFileLock, appendEvent } from './local-store.mjs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -25,7 +26,7 @@ export const AUTOMATION_STAGES = Object.freeze([
 export function parseRepoSlug(repo) {
   const s = String(repo || '').trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/, '');
   const m = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(s);
-  if (!m) throw new Error(`Repository must be owner/name, got: ${repo}`);
+  if (!m || m.slice(1).some(part => part === '.' || part === '..')) throw new Error(`Repository must be owner/name, got: ${repo}`);
   return { owner: m[1], name: m[2], slug: `${m[1]}/${m[2]}` };
 }
 
@@ -84,6 +85,9 @@ export async function loadIssueState(repo, issueNumber, env = process.env) {
   if (!existsSync(file)) return null;
   const raw = await readFile(file, 'utf8');
   const parsed = JSON.parse(raw);
+  if (parsed.version !== 1 || parsed.repository !== parseRepoSlug(repo).slug || parsed.issueNumber !== Number(issueNumber) || !AUTOMATION_STAGES.includes(parsed.stage)) {
+    throw new Error(`Invalid or mismatched Issue state: ${file}. Preserve this file and inspect it before resuming.`);
+  }
   return parsed;
 }
 
@@ -94,31 +98,21 @@ export async function saveIssueState(state, env = process.env) {
   const tmp = `${file}.${randomBytes(4).toString('hex')}.tmp`;
   await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
   await rename(tmp, file);
+  await appendEvent(`${file}.events.jsonl`, 'state.saved', { stage: next.stage, commitSha: next.commitSha, attempt: next.attempt });
   return next;
 }
 
-export async function acquireIssueLock(repo, issueNumber, env = process.env, { holder = process.pid, staleMs = 2 * 60 * 60 * 1000 } = {}) {
+const leases = new Map();
+export async function acquireIssueLock(repo, issueNumber, env = process.env, { holder = process.pid } = {}) {
   const file = issueLockPath(repo, issueNumber, env);
-  await mkdir(path.dirname(file), { recursive: true });
-  if (existsSync(file)) {
-    try {
-      const existing = JSON.parse(await readFile(file, 'utf8'));
-      const age = Date.now() - new Date(existing.at || 0).getTime();
-      if (Number.isFinite(age) && age < staleMs) {
-        return { ok: false, reason: 'concurrency lock held', lock: existing };
-      }
-    } catch {
-      /* replace corrupt lock */
-    }
-  }
-  const payload = { holder: String(holder), at: new Date().toISOString(), repo, issueNumber };
-  await writeFile(file, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-  return { ok: true, lock: payload, path: file };
+  const lease = await acquireFileLock(file, { holder: String(holder), repo, issueNumber });
+  if (lease.ok) leases.set(file, lease);
+  return lease;
 }
-
 export async function releaseIssueLock(repo, issueNumber, env = process.env) {
   const file = issueLockPath(repo, issueNumber, env);
-  if (!existsSync(file)) return;
-  const { unlink } = await import('node:fs/promises');
-  await unlink(file);
+  const lease = leases.get(file);
+  if (!lease) return;
+  await releaseFileLock(lease);
+  leases.delete(file);
 }
