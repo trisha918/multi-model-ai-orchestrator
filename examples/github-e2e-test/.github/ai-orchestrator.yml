@@ -1,0 +1,19 @@
+automation:
+  enabled: true
+  mode: assisted
+  trigger_label: ai-auto
+  max_fix_attempts: 5
+  allowed_actors: []
+
+pull_request:
+  create: true
+  auto_merge: false
+
+tests:
+  required: true
+
+review:
+  required: false
+
+publish:
+  enabled: false

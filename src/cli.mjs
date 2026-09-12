@@ -15,8 +15,9 @@ import { userConfigPath, installationInfo } from './paths.mjs';
 import { installSkills, uninstallSkills } from './skills.mjs';
 import { loadRegistry } from './model-cache.mjs';
 import { formatModelsReport } from './model-registry.mjs';
+import { parseGithubCli, githubHelpText } from './github-options.mjs';
 
-export const COMMANDS = ['doctor', 'version', 'run', 'cleanup', 'config', 'install-skills', 'uninstall-skills', 'models'];
+export const COMMANDS = ['doctor', 'version', 'run', 'cleanup', 'config', 'install-skills', 'uninstall-skills', 'models', 'github', 'runs', 'memory', 'queue', 'routing'];
 
 export function printVersion() {
   return `Multi-Model AI Orchestrator v${VERSION}`;
@@ -45,6 +46,7 @@ export function parseCli(argv) {
   const command = args[0];
   const rest = args.slice(1);
 
+  if (['runs','memory','queue','routing'].includes(command)) return { command, argv: rest };
   if (command === 'version') return { command: 'version', argv: rest, flags: {} };
   if (command === 'doctor') return { command: 'doctor', argv: rest, flags: {} };
   if (command === 'run') return { command: 'run', argv: rest, flags: {}, taskArgs: parseTaskArgs(rest) };
@@ -53,6 +55,9 @@ export function parseCli(argv) {
   if (command === 'uninstall-skills') return { command: 'uninstall-skills', argv: rest, flags: {} };
   if (command === 'models') {
     return { command: 'models', argv: rest, refresh: rest[0] === 'refresh' };
+  }
+  if (command === 'github') {
+    return { command: 'github', argv: rest, github: parseGithubCli(rest) };
   }
   if (command === 'config') {
     const sub = rest[0] || 'show';
@@ -84,6 +89,11 @@ export function helpText() {
     '  version             Print the package version',
     '  run                 Run a task (same flags as npm run task)',
     '  models              Show discovered models (use `models refresh` to re-query CLIs)',
+    '  runs                Local execution history: list, show, events',
+    '  memory              Repository notes: add, list, search, remove',
+    '  queue               Local jobs: add, list, run, cancel, recover',
+    '  routing             Measured route stats and recommendations',
+    '  github              Optional GitHub issue automation (see `github --help`)',
     '  cleanup             List or delete old runs/worktrees (dry-run unless --apply)',
     '  config show         Show effective configuration',
     '  config path         Print the user config.json path',
@@ -101,11 +111,16 @@ export function helpText() {
     '  --model-id <id>     Exact provider model id (do not combine with --model)',
     '  --cursor-model --codex-model --gemini-model   Per-worker aliases',
     '  --commit-on-pass --max-fix-rounds --branch --in-place --windows-unelevated',
+    '  --max-seconds <n> --max-processes <n>  Run budgets (defaults 3600 and 20)',
+    '  --memory            Include relevant notes explicitly saved for this repository',
+    '  --routing heuristic|learned  History-based routing is opt-in; manual mode wins',
     '',
     `Config precedence: ${CONFIG_PRECEDENCE.join(' → ')}`,
     'Model env overrides: AI_CURSOR_MODEL, AI_CODEX_MODEL, AI_GEMINI_MODEL',
     '',
-    'There is no ai-orchestrator update in v1.0. To update a Git clone:',
+    githubHelpText(),
+    '',
+    'There is no ai-orchestrator update in v1.1. To update a Git clone:',
     '  git pull',
     '  npm install',
     '  .\\install.ps1',
@@ -164,8 +179,13 @@ async function cmdConfig(parsed) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const parsed = parseCli(argv);
-  if (parsed.command === 'help') {
+  let parsed;
+  try { parsed = parseCli(argv); } catch (error) { console.error(error.message); return 2; }
+  if (['runs','memory','queue','routing'].includes(parsed.command)) {
+    try { const { localCommand } = await import('./local-cli.mjs'); return await localCommand(parsed.command, parsed.argv); }
+    catch (e) { console.error(e.message); return 2; }
+  }
+  if (parsed.command === 'help' || (parsed.command === 'run' && parsed.argv.includes('--help'))) {
     console.log(helpText());
     return 0;
   }
@@ -203,6 +223,15 @@ export async function main(argv = process.argv.slice(2)) {
     } catch (e) {
       console.error(e instanceof Error ? e.message : String(e));
       return 1;
+    }
+  }
+  if (parsed.command === 'github') {
+    try {
+      const { cmdGithub } = await import('./github-cli.mjs');
+      return await cmdGithub(parsed.github || parseGithubCli(parsed.argv));
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      return 2;
     }
   }
   if (parsed.command === 'install-skills') {

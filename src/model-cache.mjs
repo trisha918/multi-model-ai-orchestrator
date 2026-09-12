@@ -66,7 +66,6 @@ export async function loadRegistry({ env = process.env, refresh = false, runners
   if (!refresh) {
     const cached = await readModelsCache(env);
     if (cached && cacheIsFresh(cached)) return { registry: cached, fromCache: true, path: modelsCachePath(env) };
-    if (cached && !runners) return { registry: cached, fromCache: true, stale: true, path: modelsCachePath(env) };
   }
   const registry = await discoverAll({ env, now: now || new Date().toISOString(), runners });
   const file = await writeModelsCache(registry, env);

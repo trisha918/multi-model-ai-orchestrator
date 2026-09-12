@@ -1,0 +1,139 @@
+name: AI Issue
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to process (trusted maintainer only)
+        required: true
+        type: string
+
+concurrency:
+  group: ai-issue-${{ github.repository }}-${{ github.event.issue.number || github.event.inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  checks: read
+  statuses: read
+  actions: read
+
+jobs:
+  authorize:
+    name: Trusted actor gate
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.label.name == 'ai-auto' }}
+    runs-on: ubuntu-latest
+    outputs:
+      allowed: ${{ steps.gate.outputs.allowed }}
+      actor: ${{ steps.gate.outputs.actor }}
+      reason: ${{ steps.gate.outputs.reason }}
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    steps:
+      - name: Verify trusted ai-auto actor
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const trigger = 'ai-auto';
+            const trusted = new Set(['admin', 'maintain', 'write']);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            let login = context.actor;
+            let issueNumber = core.getInput('issue_number') || '';
+            if (context.eventName === 'issues') {
+              const label = context.payload.label?.name || '';
+              if (label !== trigger) {
+                core.setOutput('allowed', 'false');
+                core.setOutput('actor', login);
+                core.setOutput('reason', 'label is not ai-auto');
+                return;
+              }
+              login = context.payload.sender?.login || login;
+              issueNumber = String(context.payload.issue?.number || '');
+            } else {
+              issueNumber = String(context.payload.inputs?.issue_number || process.env.ISSUE_NUMBER || '');
+            }
+            let permission = 'none';
+            try {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner,
+                repo,
+                username: login,
+              });
+              permission = data.permission || data.role_name || 'none';
+            } catch (err) {
+              permission = 'none';
+            }
+            const allowed = trusted.has(String(permission).toLowerCase());
+            core.setOutput('allowed', allowed ? 'true' : 'false');
+            core.setOutput('actor', login);
+            core.setOutput('reason', allowed
+              ? `trusted permission=${permission}`
+              : `untrusted trigger actor permission=${permission}`);
+            core.info(`actor=@${login} permission=${permission} allowed=${allowed}`);
+            if (!allowed && issueNumber) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: Number(issueNumber),
+                body: [
+                  'AI Automation — Blocked',
+                  '',
+                  'AUTOMATION BLOCKED',
+                  'Reason: untrusted trigger actor',
+                  '',
+                  'The self-hosted AI runner was not started.',
+                ].join('\n'),
+              });
+            }
+
+  automate:
+    name: Authorized AI issue run
+    needs: authorize
+    if: ${{ needs.authorize.outputs.allowed == 'true' }}
+    runs-on: [self-hosted, Windows, ai-orchestrator]
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      statuses: read
+      actions: read
+    steps:
+      - name: Checkout default branch only
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Defense-in-depth authorize
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+        shell: powershell
+        run: |
+          if (-not $env:ISSUE_NUMBER) { throw 'Missing issue number' }
+          $npmRoot = (& cmd.exe /d /s /c 'npm root -g').Trim()
+          $entry = Join-Path $npmRoot 'multi-model-ai-orchestrator\bin\ai-orchestrator.mjs'
+          if (-not (Test-Path -LiteralPath $entry)) { throw "Missing orchestrator CLI: $entry" }
+          & node.exe $entry @('github','authorize','--repo',$env:GITHUB_REPOSITORY,'--issue',$env:ISSUE_NUMBER)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run orchestrator GitHub automation
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+        shell: powershell
+        run: |
+          if (-not $env:ISSUE_NUMBER) { throw 'Missing issue number' }
+          $npmRoot = (& cmd.exe /d /s /c 'npm root -g').Trim()
+          $entry = Join-Path $npmRoot 'multi-model-ai-orchestrator\bin\ai-orchestrator.mjs'
+          if (-not (Test-Path -LiteralPath $entry)) { throw "Missing orchestrator CLI: $entry" }
+          & node.exe $entry @('github','issue','run','--repo',$env:GITHUB_REPOSITORY,'--issue',$env:ISSUE_NUMBER)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

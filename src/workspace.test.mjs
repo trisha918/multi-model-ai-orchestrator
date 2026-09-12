@@ -34,6 +34,21 @@ function initRepo(dir) {
   git(dir, ['config', 'user.name', 'Test']);
 }
 
+test('Windows short and long paths have one identity, including not-yet-created children', { skip: process.platform !== 'win32' }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'orchestrator long directory '));
+  try {
+    // This fixed test command only asks cmd for an OS-generated temp path's alias.
+    const r = spawnSync('cmd.exe', ['/d', '/s', '/c', `for %I in ("${dir}") do @echo %~sI`], { encoding: 'utf8', windowsVerbatimArguments: true });
+    assert.equal(r.status, 0, r.stderr);
+    const short = r.stdout.trim();
+    assert.ok(short);
+    assert.ok(pathsEqual(short, dir));
+    assert.ok(pathsEqual(path.join(short, 'future'), path.join(dir, 'future')));
+    assert.ok(isInsideDir(dir, path.join(short, 'future')));
+    assert.equal(isInsideDir(dir, path.join(short, '..', 'outside')), false);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test('inspectSourceRepo rejects non-git directories', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-nogit-'));
   try {
@@ -146,7 +161,7 @@ test('resolveTaskRepo uses --repo when provided and cwd git root otherwise, neve
     const flagged = await resolveTaskRepo(dir, os.tmpdir());
     assert.equal(path.resolve(flagged), path.resolve(dir));
     const fromCwd = await resolveTaskRepo('', dir);
-    assert.equal(path.resolve(fromCwd), path.resolve(dir));
+    assert.ok(pathsEqual(fromCwd, dir), 'Git may return the expanded spelling of a Windows 8.3 path');
     assert.notEqual(path.resolve(fromCwd), path.resolve(packageRoot()));
     await assert.rejects(() => resolveTaskRepo('', os.tmpdir()), /will not guess another repository/);
   } finally {

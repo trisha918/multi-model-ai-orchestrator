@@ -1,0 +1,21 @@
+{
+  "scenario": "crash-during-push",
+  "lifecycle": true,
+  "repo": "owner/app",
+  "issue": {
+    "number": 2,
+    "title": "Harden checkout validation",
+    "body": "Reject empty coupon codes.",
+    "labels": ["ai-auto"]
+  },
+  "actor": { "login": "maintainer", "permission": "admin", "association": "OWNER" },
+  "config": {
+    "automation": { "enabled": true, "mode": "assisted", "max_fix_attempts": 5 },
+    "review": { "required": false },
+    "tests": { "required": true }
+  },
+  "ci": "PASS",
+  "localTests": "PASS",
+  "crashOnPush": true,
+  "resumeAfterCrash": true
+}

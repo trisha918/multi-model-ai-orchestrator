@@ -39,6 +39,9 @@ test('CLI command parsing', () => {
   assert.equal(parseCli(['uninstall-skills']).command, 'uninstall-skills');
   assert.equal(parseCli(['models']).command, 'models');
   assert.equal(parseCli(['models', 'refresh']).refresh, true);
+  assert.equal(parseCli(['github', 'status', '--repo', 'a/b', '--issue', '42']).command, 'github');
+  assert.equal(parseCli(['github', 'issue', 'run', '--repo', 'a/b', '--issue', '1']).github.subcommand, 'issue run');
+  assert.equal(parseCli(['github', 'doctor', '--repo', 'a/b']).github.subcommand, 'doctor');
   assert.equal(parseCli(['nope']).command, 'unknown');
   const run = parseCli(['run', '--repo', 'C:\\Projects\\My App', '--mode', 'auto', '--task', 'Fix it']);
   assert.equal(run.command, 'run');
@@ -61,7 +64,7 @@ test('special-character preservation through global CLI parser', () => {
 test('global CLI version works outside repository cwd', () => {
   const r = runCli(['version'], { cwd: os.tmpdir() });
   assert.equal(r.status, 0, r.stderr || r.stdout);
-  assert.match(r.stdout, /Multi-Model AI Orchestrator v1\.0\.0/);
+  assert.match(r.stdout, /Multi-Model AI Orchestrator v1\.1\.0/);
 });
 
 test('global CLI doctor works outside repository cwd', () => {

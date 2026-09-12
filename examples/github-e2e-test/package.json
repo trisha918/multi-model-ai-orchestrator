@@ -1,0 +1,12 @@
+{
+  "name": "ai-orchestrator-e2e-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Private-repo template for the first Multi-Model AI Orchestrator GitHub Issue live test.",
+  "scripts": {
+    "test": "node --test calculator.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

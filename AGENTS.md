@@ -5,7 +5,7 @@ This repository is the Multi-Model AI Orchestrator. Keep Windows native support 
 - Never require `agent.exe`. Prefer `%LOCALAPPDATA%\cursor-agent\agent.cmd` or the latest `cursor-agent.cmd` under `versions\`. Prefer launching Cursor via `node.exe` + `index.js` so task text is not passed through cmd delayed expansion.
 - Prefer Git worktree isolation. Store run logs and worktrees in the per-user runtime directory (`%LOCALAPPDATA%\MultiModelAIOrchestrator\`), not in user project repos. Cleanup may also remove leftover clone-local `runs/` and `worktrees/` from older versions.
 - Team mode: Cursor plans, Codex implements, independent tests run, Gemini reviews, Codex fixes within a bounded loop.
-- Do not push, merge, or deploy automatically.
+- Do not push, merge, or deploy automatically. v1.1 GitHub automation is optional and must stop at ready-for-human-merge.
 - User task text must not be interpolated into shell command strings. Spawn with argument arrays; wrap Windows `.cmd` via `cmd.exe /d /s /c` with escaped arguments, never `shell: true`.
 - Independent project tests are executed by the orchestrator; do not treat agent claims as verification.
 - Do not auto-trust arbitrary directories; `--trust` is only for verified orchestrator worktrees.
