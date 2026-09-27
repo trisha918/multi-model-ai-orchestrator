@@ -12,7 +12,6 @@ export function isPullForIssue(pr, issueNumber) {
 
 export function redactGithubText(text) {
   return redactCiText(text)
-    .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
     .replace(/ghu_[A-Za-z0-9_]+/g, 'ghu_[redacted]');
 }
 

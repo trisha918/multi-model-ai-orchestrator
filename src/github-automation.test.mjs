@@ -1663,3 +1663,57 @@ test('push failure redaction reaches state, events, and CLI output without secre
     }
   }
 });
+
+test('escaped quoted push secrets leave no suffix in state, events, or CLI output', async () => {
+  const cases = [
+    ['Authorization: "Bearer abc\\"def SecretSuffix"', ['abc\\"def SecretSuffix', 'SecretSuffix']],
+    ["Authorization: 'Bearer abc\\'def SecretSuffix'", ["abc\\'def SecretSuffix", 'SecretSuffix']],
+    ['GH_TOKEN="token with \\"embedded\\" secret suffix"', ['token with \\"embedded\\" secret suffix', 'secret suffix']],
+    ["GITHUB_TOKEN='token with \\'embedded\\' secret suffix'", ["token with \\'embedded\\' secret suffix", 'secret suffix']],
+    ['password="my \\"escaped\\" password value"', ['my \\"escaped\\" password value', 'password value']],
+    ["secret='my \\'escaped\\' secret value'", ["my \\'escaped\\' secret value", 'secret value']],
+    ['api-key="api \\"embedded\\" secret value"', ['api \\"embedded\\" secret value', 'secret value']],
+    ['OPENAI_API_KEY="sk-test-\\"quoted\\"-secret-suffix"', ['sk-test-\\"quoted\\"-secret-suffix', 'secret-suffix']],
+  ];
+  for (const [message, fragments] of cases) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-escaped-redaction-'));
+    const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+    const client = createMemoryGithubClient(seedIssue());
+    const events = createGithubEventLog();
+    try {
+      const result = await runIssueAutomation({
+        client,
+        config: assisted,
+        repo: 'owner/app',
+        issueNumber: 42,
+        env,
+        eventLog: events,
+        runImplementation: async ({ branch }) => ({
+          ok: true, tests: 'PASS', review: 'SKIP', commit: 'd'.repeat(40), branch,
+        }),
+        gitPush: async () => {
+          throw new Error(`push rejected: ${message}`);
+        },
+      });
+      const saved = await loadIssueState('owner/app', 42, env);
+      const destinations = [
+        JSON.stringify(saved),
+        JSON.stringify(events.records),
+        formatGithubStatus({
+          issue: { number: 42, title: 'Fix checkout validation' },
+          automationMode: result.state.mode,
+          state: result.state,
+        }),
+      ];
+      assert.equal(result.code, 1, message);
+      for (const fragment of fragments) {
+        const escaped = new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        for (const destination of destinations) {
+          assert.doesNotMatch(destination, escaped, `${message} leaked ${fragment}`);
+        }
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});

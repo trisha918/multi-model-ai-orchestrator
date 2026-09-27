@@ -59,6 +59,27 @@ test('credential redaction consumes complete bearer and quoted assignment values
   }
 });
 
+test('credential redaction consumes escape-aware quoted values without suffix leaks', () => {
+  const cases = [
+    ['Authorization: "Bearer abc\\"def SecretSuffix"', ['abc\\"def SecretSuffix', 'SecretSuffix']],
+    ["Authorization: 'Bearer abc\\'def SecretSuffix'", ["abc\\'def SecretSuffix", 'SecretSuffix']],
+    ['GH_TOKEN="token with \\"embedded\\" secret suffix"', ['token with \\"embedded\\" secret suffix', 'secret suffix']],
+    ["GITHUB_TOKEN='token with \\'embedded\\' secret suffix'", ["token with \\'embedded\\' secret suffix", 'secret suffix']],
+    ['password="my \\"escaped\\" password value"', ['my \\"escaped\\" password value', 'password value']],
+    ["secret='my \\'escaped\\' secret value'", ["my \\'escaped\\' secret value", 'secret value']],
+    ['api-key="api \\"embedded\\" secret value"', ['api \\"embedded\\" secret value', 'secret value']],
+    ['OPENAI_API_KEY="sk-test-\\"quoted\\"-secret-suffix"', ['sk-test-\\"quoted\\"-secret-suffix', 'secret-suffix']],
+    ['GH_TOKEN="token with \\\\backslash secret suffix"', ['token with \\\\backslash secret suffix', 'secret suffix']],
+  ];
+  for (const [input, fragments] of cases) {
+    const output = redactCiText(input);
+    for (const fragment of fragments) {
+      assert.doesNotMatch(output, new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), input);
+    }
+    assert.match(output, /redacted/i, input);
+  }
+});
+
 test('credential redaction preserves ordinary diagnostics', () => {
   for (const text of [
     'GitHub API timeout while creating PR',
