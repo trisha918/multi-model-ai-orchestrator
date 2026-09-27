@@ -368,9 +368,16 @@ async function upsertStatus(client, { owner, name, issueNumber, state, body, dry
   return { ...state, statusCommentId: rec.id };
 }
 
-async function applyLabels(client, { owner, name, issueNumber, issue, stage, dryRun, plan, keepTrigger = true }) {
-  const desired = reconcileStatusLabels(issue.labels || [], statusLabelForStage(stage), { keepTrigger });
-  const diff = labelDiff(issue.labels || [], desired);
+/**
+ * Reconcile against labels currently on GitHub, rather than the Issue snapshot
+ * captured at automation start. GitHub returns independent response objects, so
+ * that snapshot does not reflect earlier add/remove requests in this run.
+ */
+export async function applyLabels(client, { owner, name, issueNumber, issue, stage, dryRun, plan, keepTrigger = true }) {
+  void issue; // Kept in the call contract while reconciliation uses fresh labels.
+  const currentLabels = await client.getLabels(owner, name, issueNumber);
+  const desired = reconcileStatusLabels(currentLabels, statusLabelForStage(stage), { keepTrigger });
+  const diff = labelDiff(currentLabels, desired);
   if (dryRun) {
     plan.steps.push({ message: 'Would update labels', add: diff.add, remove: diff.remove, write: true, skipped: true });
     return;
