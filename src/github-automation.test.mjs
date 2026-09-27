@@ -12,12 +12,13 @@ import {
   runIssueAutomation,
   simulateGithubAutomation,
   CI_STATUS,
+  applyLabels,
   assertRequiredReviewRoute,
   diagnoseImplementationGateFailure,
   REQUIRED_REVIEW_NEEDS_TEAM,
 } from './github-automation.mjs';
 import { acquireIssueLock, loadIssueState, saveIssueState, emptyState } from './github-state.mjs';
-import { TRIGGER_LABEL, STOP_LABEL, RoutingConflictError } from './github-labels.mjs';
+import { TRIGGER_LABEL, STOP_LABEL, STATUS_LABELS, RoutingConflictError } from './github-labels.mjs';
 import { authorizeAiAutoTrigger } from './github-auth.mjs';
 
 const assisted = parseRepoConfigText(`
@@ -1432,4 +1433,72 @@ test('WAITING_FOR_CI resume with disabled cwd config still becomes READY_FOR_HUM
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('status-label reconciliation uses fresh copies from GitHub and stays idempotent', async () => {
+  const server = { labels: new Set([TRIGGER_LABEL, 'bug', 'customer-visible']) };
+  const actions = [];
+  let reads = 0;
+  const client = {
+    // Deliberately model the GitHub API: every read is a new object and old
+    // snapshots remain stale after mutations.
+    async getIssue() {
+      return {
+        number: 42,
+        labels: [...server.labels].map(name => ({ name })),
+      };
+    },
+    async getLabels() {
+      reads += 1;
+      const issue = await this.getIssue();
+      return issue.labels;
+    },
+    async addLabel(_owner, _name, _number, label) {
+      actions.push({ op: 'add', label });
+      server.labels.add(label);
+    },
+    async removeLabel(_owner, _name, _number, label) {
+      actions.push({ op: 'remove', label });
+      server.labels.delete(label);
+    },
+  };
+  const staleIssue = await client.getIssue();
+  const assertStage = (expected) => {
+    const statuses = [...server.labels].filter(label => STATUS_LABELS.includes(label));
+    assert.deepEqual(statuses, [expected]);
+    assert.ok(server.labels.has(TRIGGER_LABEL));
+    assert.ok(server.labels.has('bug'));
+    assert.ok(server.labels.has('customer-visible'));
+  };
+  const apply = (stage) => applyLabels(client, {
+    owner: 'owner',
+    name: 'app',
+    issueNumber: 42,
+    // This is deliberately the first stale snapshot for every transition.
+    issue: staleIssue,
+    stage,
+    dryRun: false,
+    plan: { steps: [] },
+  });
+
+  await apply('WORKING');
+  assertStage('ai-working');
+  await apply('LOCAL_TESTS');
+  assertStage('ai-needs-test');
+  await apply('READY_FOR_HUMAN_MERGE');
+  assertStage('ai-ready-to-merge');
+  assert.deepEqual(staleIssue.labels.map(label => label.name), [TRIGGER_LABEL, 'bug', 'customer-visible']);
+
+  const mutationsBeforeIdempotentRun = actions.length;
+  const readsBeforeIdempotentRun = reads;
+  await apply('READY_FOR_HUMAN_MERGE');
+  assert.equal(actions.length, mutationsBeforeIdempotentRun);
+  assert.equal(reads, readsBeforeIdempotentRun + 1);
+  assertStage('ai-ready-to-merge');
+
+  // Failure transition must remove the prior working status using fresh labels.
+  server.labels = new Set([TRIGGER_LABEL, 'bug', 'customer-visible', 'ai-working']);
+  await apply('FAILED');
+  assertStage('ai-failed');
+  assert.ok(!server.labels.has('ai-working'));
 });
