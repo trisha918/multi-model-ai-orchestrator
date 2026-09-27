@@ -16,6 +16,7 @@ import {
   assertRequiredReviewRoute,
   diagnoseImplementationGateFailure,
   isEstablishedExecutionRoute,
+  isEstablishedExecutionModel,
   REQUIRED_REVIEW_NEEDS_TEAM,
 } from './github-automation.mjs';
 import { acquireIssueLock, loadIssueState, saveIssueState, emptyState } from './github-state.mjs';
@@ -2021,6 +2022,288 @@ test('CI fix loop resume preserves original implementation route', async () => {
     assert.equal(result.state.selectedRoute, 'AUTO');
     assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
     const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.route, 'CODEX');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('isEstablishedExecutionModel recognizes concrete models only', () => {
+  assert.equal(isEstablishedExecutionModel('gpt-5.6-terra'), true);
+  assert.equal(isEstablishedExecutionModel('gpt-5.6-sol'), true);
+  assert.equal(isEstablishedExecutionModel('terra'), true);
+  assert.equal(isEstablishedExecutionModel('AUTO'), false);
+  assert.equal(isEstablishedExecutionModel('auto'), false);
+  assert.equal(isEstablishedExecutionModel(''), false);
+  assert.equal(isEstablishedExecutionModel(null), false);
+  assert.equal(isEstablishedExecutionModel(undefined), false);
+});
+
+test('resume preserves AUTO-selected concrete model instead of rewriting to AUTO', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-model-auto-terra-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const commit = '1'.repeat(40);
+  const actualModel = 'gpt-5.6-terra';
+  let implCalls = 0;
+  try {
+    const first = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch, routing }) => {
+        implCalls += 1;
+        assert.equal(routing.worker, 'AUTO');
+        assert.equal(routing.selection, 'AUTO');
+        return {
+          ok: true,
+          tests: 'PASS',
+          review: 'PASS',
+          commit,
+          branch,
+          route: 'CODEX',
+          model: actualModel,
+        };
+      },
+      gitPush: async () => ({ sha: commit }),
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'checks pending' }),
+    });
+    assert.equal(first.state.model, actualModel);
+    assert.equal(first.state.route, 'CODEX');
+    assert.equal(first.state.implementationAttempt, 1);
+    assert.equal(implCalls, 1);
+    const afterFirst = await loadIssueState('owner/app', 42, env);
+    assert.equal(afterFirst.model, actualModel);
+    assert.equal(afterFirst.route, 'CODEX');
+
+    const second = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('resume must not re-run implementation solely for model');
+      },
+      gitPush: async () => {
+        throw new Error('resume must not push again');
+      },
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'checks pending' }),
+    });
+    assert.equal(second.state.model, actualModel);
+    assert.notEqual(second.state.model, 'AUTO');
+    assert.equal(second.state.selectedModels, 'AUTO');
+    assert.equal(second.state.route, 'CODEX');
+    assert.equal(second.state.selectedRoute, 'AUTO');
+    assert.equal(second.state.implementationAttempt, 1);
+    assert.equal(second.state.commitSha, commit);
+    assert.equal(second.state.branch, first.state.branch);
+    assert.equal(second.state.localTests, 'PASS');
+    assert.equal(second.state.stage, 'WAITING_FOR_CI');
+    assert.equal(implCalls, 1);
+    const saved = await loadIssueState('owner/app', 42, env);
+    assert.equal(saved.model, actualModel);
+    assert.equal(saved.route, 'CODEX');
+    assert.equal(saved.implementationAttempt, 1);
+    assert.equal(saved.commitSha, commit);
+    assert.equal(saved.branch, first.state.branch);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('resume keeps historical model when current selection would choose another', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-model-a-b-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '2'.repeat(40);
+  const branch = 'ai/issue-42-fix-checkout-validation';
+  const modelA = 'gpt-5.6-sol';
+  // Current labels request a different manual Codex alias (terra).
+  const client = createMemoryGithubClient(seedIssue({ labels: [TRIGGER_LABEL, 'ai-codex-terra'] }));
+  let implCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 42, title: 'Fix checkout validation', html_url: 'https://github.com/owner/app/issues/42' },
+      }),
+      stage: 'LOCAL_TESTS',
+      localTests: 'PASS',
+      review: 'PASS',
+      commitSha: commit,
+      branch,
+      route: 'CODEX',
+      selectedRoute: 'AUTO',
+      model: modelA,
+      selectedModels: 'AUTO',
+      implementationAttempt: 1,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        return {
+          ok: true,
+          tests: 'PASS',
+          review: 'PASS',
+          commit: 'wrong',
+          branch: 'ai/wrong',
+          route: 'CODEX',
+          model: 'gpt-5.6-terra',
+        };
+      },
+      gitPush: async () => ({ sha: commit }),
+      waitForCi: async () => ({ status: CI_STATUS.PASS, summary: 'ok' }),
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(result.state.model, modelA);
+    assert.notEqual(result.state.model, 'gpt-5.6-terra');
+    assert.notEqual(result.state.model, 'terra');
+    assert.equal(result.state.selectedModels, 'terra');
+    assert.equal(result.state.route, 'CODEX');
+    assert.equal(result.state.implementationAttempt, 1);
+    assert.equal(result.state.commitSha, commit);
+    assert.equal(result.state.branch, branch);
+    assert.equal(result.state.localTests, 'PASS');
+    const saved = await loadIssueState('owner/app', 42, env);
+    assert.equal(saved.model, modelA);
+    assert.equal(saved.route, 'CODEX');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('manual concrete model survives resume', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-model-manual-sol-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '3'.repeat(40);
+  const branch = 'ai/issue-42-fix-checkout-validation';
+  const manualModel = 'gpt-5.6-sol';
+  const client = createMemoryGithubClient(seedIssueNumber(42, {
+    seed: {
+      checks: {
+        [commit]: [{ name: 'test', status: 'in_progress', conclusion: null }],
+      },
+      pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #42', issueNumber: 42 }],
+    },
+  }));
+  const issue = await client.getIssue('owner', 'app', 42);
+  issue.labels = [{ name: TRIGGER_LABEL }, { name: 'ai-codex-sol' }];
+  let implCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 42, title: 'Fix checkout validation', html_url: 'https://github.com/owner/app/issues/42' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      localTests: 'PASS',
+      review: 'PASS',
+      githubCi: 'PENDING',
+      commitSha: commit,
+      branch,
+      prNumber: 7,
+      route: 'CODEX',
+      selectedRoute: 'CODEX',
+      model: manualModel,
+      selectedModels: 'sol',
+      implementationAttempt: 1,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('must not re-implement');
+      },
+      gitPush: async () => {
+        throw new Error('must not push');
+      },
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(result.state.model, manualModel);
+    assert.equal(result.state.selectedModels, 'sol');
+    assert.equal(result.state.route, 'CODEX');
+    assert.equal(result.state.implementationAttempt, 1);
+    assert.equal(result.state.commitSha, commit);
+    assert.equal(result.state.branch, branch);
+    assert.equal(result.state.stage, 'WAITING_FOR_CI');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('CI fix loop resume preserves original model when fix omits model', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-model-ci-fix-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '4'.repeat(40);
+  const branch = 'ai/issue-6-add-divide-operation-and-tests';
+  const actualModel = 'gpt-5.6-terra';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: {
+      checks: {
+        [commit]: [{ name: 'test', status: 'completed', conclusion: 'failure' }],
+      },
+      pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #6', issueNumber: 6 }],
+    },
+  }));
+  let fixCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      githubCi: 'UNKNOWN',
+      localTests: 'PASS',
+      review: 'PASS',
+      commitSha: commit,
+      branch,
+      route: 'CODEX',
+      selectedRoute: 'AUTO',
+      model: actualModel,
+      selectedModels: 'AUTO',
+      implementationAttempt: 1,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async () => {
+        fixCalls += 1;
+        // Omit model so applyImplementationResult does not rewrite provenance.
+        return { ok: true, tests: 'PASS', review: 'PASS', commit, branch };
+      },
+      gitPush: async () => ({ sha: commit }),
+    });
+    assert.equal(fixCalls, 4);
+    assert.equal(result.state.model, actualModel);
+    assert.notEqual(result.state.model, 'AUTO');
+    assert.equal(result.state.selectedModels, 'AUTO');
+    assert.equal(result.state.route, 'CODEX');
+    assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.model, actualModel);
     assert.equal(saved.route, 'CODEX');
   } finally {
     await rm(dir, { recursive: true, force: true });
