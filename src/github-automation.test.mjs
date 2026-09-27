@@ -21,6 +21,7 @@ import { acquireIssueLock, loadIssueState, saveIssueState, emptyState } from './
 import { TRIGGER_LABEL, STOP_LABEL, STATUS_LABELS, RoutingConflictError } from './github-labels.mjs';
 import { authorizeAiAutoTrigger } from './github-auth.mjs';
 import { createGithubEventLog } from './github-events.mjs';
+import { formatGithubStatus } from './github-pr.mjs';
 
 const assisted = parseRepoConfigText(`
 automation:
@@ -1613,5 +1614,52 @@ test('PR creation failure is persisted, redacted, labelled, and does not retry',
     assert.doesNotMatch(event.result, /PRSECRET|gho_PRSECRET|Bearer/);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('push failure redaction reaches state, events, and CLI output without secret remnants', async () => {
+  const cases = [
+    ['Authorization: Bearer abc123SECRET', 'abc123SECRET'],
+    ['GH_TOKEN="token with spaces"', 'token with spaces'],
+    ['api-key: "api secret value"', 'api secret value'],
+    ["password='my long password'", 'my long password'],
+    ['Authorization: bEaReR MixedCaseSecret123', 'MixedCaseSecret123'],
+  ];
+  for (const [message, secret] of cases) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-redaction-'));
+    const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+    const client = createMemoryGithubClient(seedIssue());
+    const events = createGithubEventLog();
+    try {
+      const result = await runIssueAutomation({
+        client,
+        config: assisted,
+        repo: 'owner/app',
+        issueNumber: 42,
+        env,
+        eventLog: events,
+        runImplementation: async ({ branch }) => ({
+          ok: true, tests: 'PASS', review: 'SKIP', commit: 'c'.repeat(40), branch,
+        }),
+        gitPush: async () => {
+          throw new Error(`push rejected: ${message}`);
+        },
+      });
+      const saved = await loadIssueState('owner/app', 42, env);
+      const output = formatGithubStatus({
+        issue: { number: 42, title: 'Fix checkout validation' },
+        automationMode: result.state.mode,
+        state: result.state,
+      });
+      const persisted = JSON.stringify(saved);
+      const eventPayload = JSON.stringify(events.records);
+      const escaped = new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      assert.equal(result.code, 1, message);
+      assert.doesNotMatch(persisted, escaped, `${message} leaked to state`);
+      assert.doesNotMatch(eventPayload, escaped, `${message} leaked to event`);
+      assert.doesNotMatch(output, escaped, `${message} leaked to CLI output`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });

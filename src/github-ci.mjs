@@ -177,8 +177,16 @@ export function collectCiFailureContext({
 
 export function redactCiText(text) {
   return String(text || '')
+    // Redact authorization before generic assignments. Otherwise an assignment
+    // rule can consume only "Bearer" and leave the credential after it.
+    .replace(/\bauthorization\s*[:=]\s*(?:"\s*bearer\s+[^"]*"|'\s*bearer\s+[^']*'|bearer\s+(?:"[^"]*"|'[^']*'|\S+))/gi, 'Authorization: [redacted]')
+    // Standalone bearer diagnostics occur in CLI/HTTP errors too. Restrict the
+    // unquoted form to credential-shaped values to avoid hiding ordinary prose.
+    .replace(/\bbearer\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9._~+/=-]{8,})/gi, 'Bearer [redacted]')
     .replace(/ghp_[A-Za-z0-9_]+/g, 'ghp_[redacted]')
     .replace(/github_pat_[A-Za-z0-9_]+/g, 'github_pat_[redacted]')
     .replace(/gho_[A-Za-z0-9_]+/g, 'gho_[redacted]')
-    .replace(/(GITHUB_TOKEN|GH_TOKEN|authorization|token|password|secret|api[_-]?key)\s*[:=]\s*\S+/gi, '$1: [redacted]');
+    // Consume complete quoted values before unquoted values, including spaces.
+    .replace(/\b((?:[A-Za-z][A-Za-z0-9]*_)*(?:GITHUB_TOKEN|GH_TOKEN|token|password|secret|api[_-]?key))\s*[:=]\s*(?:"[^"]*"|'[^']*')/gi, '$1: [redacted]')
+    .replace(/\b((?:[A-Za-z][A-Za-z0-9]*_)*(?:GITHUB_TOKEN|GH_TOKEN|token|password|secret|api[_-]?key))\s*[:=]\s*\S+/gi, '$1: [redacted]');
 }

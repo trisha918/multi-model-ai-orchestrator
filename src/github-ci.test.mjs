@@ -33,3 +33,39 @@ test('CI logs and secrets are redacted in failure context', () => {
   assert.match(redactCiText('token: ghp_abc'), /redacted/);
   assert.doesNotMatch(redactCiText('OPENAI_API_KEY=sk_provider_secret'), /sk_provider_secret/);
 });
+
+test('credential redaction consumes complete bearer and quoted assignment values', () => {
+  const cases = [
+    ['Authorization: Bearer abc123SECRET', 'abc123SECRET'],
+    ['authorization: bearer abc123SECRET', 'abc123SECRET'],
+    ['Authorization=Bearer abc123SECRET', 'abc123SECRET'],
+    ['Authorization: "Bearer abc123SECRET"', 'abc123SECRET'],
+    ['GH_TOKEN=abc123', 'abc123'],
+    ['GH_TOKEN="token with spaces"', 'token with spaces'],
+    ["GITHUB_TOKEN='token with spaces'", 'token with spaces'],
+    ['token=abc123', 'abc123'],
+    ['token: abc123', 'abc123'],
+    ['password="password with spaces"', 'password with spaces'],
+    ["secret='secret with spaces'", 'secret with spaces'],
+    ['api_key="api secret value"', 'api secret value'],
+    ['api-key: "api secret value"', 'api secret value'],
+    ["apikey='api secret value'", 'api secret value'],
+    ['Bearer abc123SECRET', 'abc123SECRET'],
+  ];
+  for (const [input, secret] of cases) {
+    const output = redactCiText(input);
+    assert.doesNotMatch(output, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), input);
+    assert.match(output, /redacted/i, input);
+  }
+});
+
+test('credential redaction preserves ordinary diagnostics', () => {
+  for (const text of [
+    'GitHub API timeout while creating PR',
+    'branch push rejected',
+    'repository not found',
+    'bearer of bad news is not a credential',
+  ]) {
+    assert.equal(redactCiText(text), text);
+  }
+});
