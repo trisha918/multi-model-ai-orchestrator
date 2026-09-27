@@ -6,6 +6,7 @@ import { authorizeAiAutoTrigger, extractLabelEventActor, BLOCK_UNTRUSTED } from 
 import { buildIssueTaskContext } from './github-task.mjs';
 import { proposeBranchName, assertSafePushBranch, prTitleForIssue, prBodyForIssue, formatStatusComment, formatGithubStatus, MILESTONE_HEADLINES } from './github-pr.mjs';
 import { classifyCheckRuns, CI_STATUS, collectCiFailureContext, redactCiText, fetchGithubCiRuns } from './github-ci.mjs';
+import { redactGithubText } from './github-client.mjs';
 import {
   parseRepoSlug,
   emptyState,
@@ -24,6 +25,12 @@ import { createGithubEventLog, issueEventsPath } from './github-events.mjs';
 
 export { CI_STATUS };
 export { isAllowedTransition, transitionStage, applyStage, ALLOWED_TRANSITIONS } from './github-state.mjs';
+
+export function safeGithubFailure(operation, error) {
+  const raw = error instanceof Error ? error.message : String(error || '');
+  const detail = redactGithubText(raw).trim();
+  return detail ? `${operation} failed: ${detail}` : `${operation} failed`;
+}
 
 export function recordCiResult(state, status) {
   if (isSettledStage(state?.stage)) {
@@ -530,7 +537,44 @@ export async function runIssueAutomation({
     let state = inspected.state || emptyState({ repo: slug, issue });
     let skipGitPush = false;
 
-    const existingPrs = await client.listPullsForIssue(owner, name, issueNumber);
+    async function recordGitHubOperationFailure({
+      operation,
+      eventAction,
+      error,
+      stage = 'HUMAN_REVIEW_REQUIRED',
+      diagnosis,
+    }) {
+      const failure = safeGithubFailure(operation, error);
+      applyStage(state, stage);
+      state.lastFailure = failure;
+      state.lastDiagnosis = diagnosis || `${operation} did not complete. Human review is required before retrying.`;
+      if (!dryRun) state = await saveIssueState(state, env);
+      await emit(eventAction, failure, state.stage);
+      try {
+        await applyLabels(client, { owner, name, issueNumber, issue, stage: state.stage, dryRun, plan });
+      } catch (labelError) {
+        // A follow-up GitHub API outage must not hide the original push/PR
+        // failure after its recovery state was safely persisted.
+        state.lastDiagnosis = `${state.lastDiagnosis} ${safeGithubFailure('GitHub failure label reconciliation', labelError)}`;
+        if (!dryRun) state = await saveIssueState(state, env);
+      }
+      return { crashed: true, failure };
+    }
+
+    let existingPrs;
+    try {
+      existingPrs = await client.listPullsForIssue(owner, name, issueNumber);
+    } catch (e) {
+      // Before implementation there is no ambiguous remote write, so FAILED is
+      // the existing fail-closed terminal state rather than a recovery gate.
+      await recordGitHubOperationFailure({
+        operation: 'GitHub PR lookup',
+        eventAction: 'pr_lookup_failed',
+        error: e,
+        stage: state.stage === 'IDLE' ? 'FAILED' : 'HUMAN_REVIEW_REQUIRED',
+      });
+      return done({ code: 1, crashed: true, plan, state, decision });
+    }
     if (existingPrs.length && !state.prNumber) {
       state.prNumber = existingPrs[0].number;
       state.branch = existingPrs[0].head?.ref || existingPrs[0].head || state.branch;
@@ -709,8 +753,28 @@ export async function runIssueAutomation({
     }
 
     async function pushBranchAndOpenPr({ skipGitPush: skipPush = false } = {}) {
-      assertSafePushBranch(state.branch);
-      const existing = await findExistingPullRequest();
+      try {
+        assertSafePushBranch(state.branch);
+      } catch (e) {
+        return recordGitHubOperationFailure({
+          operation: 'GitHub branch push validation',
+          eventAction: 'push_failed',
+          error: e,
+          stage: 'CONFLICT',
+          diagnosis: 'The automation branch is unsafe to push. Human review is required.',
+        });
+      }
+      let existing;
+      try {
+        existing = await findExistingPullRequest();
+      } catch (e) {
+        return recordGitHubOperationFailure({
+          operation: 'GitHub PR lookup',
+          eventAction: 'pr_lookup_failed',
+          error: e,
+          diagnosis: 'Could not determine whether a pull request already exists. Human review is required before retrying.',
+        });
+      }
       if (existing?.number) {
         state.prNumber = existing.number;
         state.unsafePushPending = false;
@@ -737,10 +801,12 @@ export async function runIssueAutomation({
           state = await saveIssueState(state, env);
           await emit('push_completed', 'ok', state.stage);
         } catch (e) {
-          state.lastFailure = e instanceof Error ? e.message : String(e);
-          state = await saveIssueState(state, env);
-          await emit('push_completed', 'FAIL', state.stage);
-          return { crashed: true };
+          return recordGitHubOperationFailure({
+            operation: 'GitHub branch push',
+            eventAction: 'push_failed',
+            error: e,
+            diagnosis: 'The remote push outcome is unknown. Human review is required before retrying.',
+          });
         }
       }
       if (config.pull_request.create && !state.prNumber) {
@@ -766,9 +832,12 @@ export async function runIssueAutomation({
           state = await saveIssueState(state, env);
           await emit('pr_created', String(pr.number), state.stage);
         } catch (e) {
-          state.lastFailure = e instanceof Error ? e.message : String(e);
-          state = await saveIssueState(state, env);
-          return { crashed: true };
+          return recordGitHubOperationFailure({
+            operation: 'GitHub PR creation',
+            eventAction: 'pr_creation_failed',
+            error: e,
+            diagnosis: 'The branch was pushed, but the pull request outcome may be unknown. Human review is required before retrying.',
+          });
         }
       }
       return { crashed: false };
@@ -914,7 +983,18 @@ export async function runIssueAutomation({
           await emit('human_review_required', state.lastDiagnosis, state.stage);
           break;
         }
-        assertSafePushBranch(state.branch);
+        try {
+          assertSafePushBranch(state.branch);
+        } catch (e) {
+          await recordGitHubOperationFailure({
+            operation: 'GitHub branch push validation',
+            eventAction: 'push_failed',
+            error: e,
+            stage: 'CONFLICT',
+            diagnosis: 'The automation branch is unsafe to push. Human review is required.',
+          });
+          return done({ code: 1, crashed: true, plan, state });
+        }
         const fixSkip = await shouldSkipGitPush({ client, owner, name, state, ignoreExistingPr: true });
         if (fixSkip.skip) {
           state.branchPushed = true;
@@ -930,9 +1010,12 @@ export async function runIssueAutomation({
             state.branchPushed = true;
             await emit('push_completed', 'ok', state.stage);
           } catch (e) {
-            state.lastFailure = e instanceof Error ? e.message : String(e);
-            state = await saveIssueState(state, env);
-            await emit('push_completed', 'FAIL', state.stage);
+            await recordGitHubOperationFailure({
+              operation: 'GitHub branch push',
+              eventAction: 'push_failed',
+              error: e,
+              diagnosis: 'The remote push outcome is unknown. Human review is required before retrying.',
+            });
             return done({ code: 1, crashed: true, plan, state });
           }
         }

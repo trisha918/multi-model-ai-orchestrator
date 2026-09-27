@@ -31,4 +31,5 @@ test('CI logs and secrets are redacted in failure context', () => {
   assert.match(ctx, /GitHub CI: FAIL/);
   assert.doesNotMatch(ctx, /ghp_SECRETTOKEN123/);
   assert.match(redactCiText('token: ghp_abc'), /redacted/);
+  assert.doesNotMatch(redactCiText('OPENAI_API_KEY=sk_provider_secret'), /sk_provider_secret/);
 });

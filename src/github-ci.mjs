@@ -180,5 +180,5 @@ export function redactCiText(text) {
     .replace(/ghp_[A-Za-z0-9_]+/g, 'ghp_[redacted]')
     .replace(/github_pat_[A-Za-z0-9_]+/g, 'github_pat_[redacted]')
     .replace(/gho_[A-Za-z0-9_]+/g, 'gho_[redacted]')
-    .replace(/(GITHUB_TOKEN|GH_TOKEN|authorization|token|password|secret)\s*[:=]\s*\S+/gi, '$1: [redacted]');
+    .replace(/(GITHUB_TOKEN|GH_TOKEN|authorization|token|password|secret|api[_-]?key)\s*[:=]\s*\S+/gi, '$1: [redacted]');
 }

@@ -45,6 +45,8 @@ test('status output matches the CLI contract', () => {
       prNumber: 51,
       localTests: 'PASS',
       githubCi: 'PENDING',
+      lastFailure: 'GitHub PR creation failed: API timeout',
+      lastDiagnosis: 'Human review is required before retrying.',
     },
   });
   assert.match(text, /#42 Fix checkout validation/);
@@ -54,6 +56,8 @@ test('status output matches the CLI contract', () => {
   assert.match(text, /CODEX/);
   assert.match(text, /gpt-5.6-terra/);
   assert.match(text, /#51/);
+  assert.match(text, /Failure:\nGitHub PR creation failed: API timeout/);
+  assert.match(text, /Diagnosis:\nHuman review is required before retrying/);
 });
 
 test('refuses to push main', () => {

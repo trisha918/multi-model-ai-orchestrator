@@ -20,6 +20,7 @@ import {
 import { acquireIssueLock, loadIssueState, saveIssueState, emptyState } from './github-state.mjs';
 import { TRIGGER_LABEL, STOP_LABEL, STATUS_LABELS, RoutingConflictError } from './github-labels.mjs';
 import { authorizeAiAutoTrigger } from './github-auth.mjs';
+import { createGithubEventLog } from './github-events.mjs';
 
 const assisted = parseRepoConfigText(`
 automation:
@@ -1501,4 +1502,116 @@ test('status-label reconciliation uses fresh copies from GitHub and stays idempo
   await apply('FAILED');
   assertStage('ai-failed');
   assert.ok(!server.labels.has('ai-working'));
+});
+
+test('push failure is persisted, redacted, labelled, and logged for human review', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-push-failure-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const events = createGithubEventLog({ now: () => '2026-09-28T00:00:00.000Z' });
+  let pushCalls = 0;
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      eventLog: events,
+      runImplementation: async ({ branch }) => ({
+        ok: true,
+        tests: 'PASS',
+        review: 'SKIP',
+        commit: 'a'.repeat(40),
+        branch,
+      }),
+      gitPush: async ({ force }) => {
+        pushCalls += 1;
+        assert.equal(force, false);
+        throw new Error('remote rejected push: GITHUB_TOKEN=ghp_PUSHSECRET');
+      },
+    });
+    assert.equal(result.code, 1);
+    assert.equal(pushCalls, 1);
+    assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(result.state.commitSha, 'a'.repeat(40));
+    assert.match(result.state.branch, /^ai\/issue-42-/);
+    assert.equal(result.state.unsafePushPending, true);
+    assert.match(result.state.lastFailure, /GitHub branch push failed/);
+    assert.doesNotMatch(result.state.lastFailure, /PUSHSECRET|ghp_PUSHSECRET/);
+    assert.match(result.state.lastDiagnosis, /outcome is unknown/i);
+    const saved = await loadIssueState('owner/app', 42, env);
+    assert.equal(saved.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(saved.commitSha, 'a'.repeat(40));
+    const labels = await client.getLabels('owner', 'app', 42);
+    assert.deepEqual(
+      labels.map(label => label.name || label).filter(label => STATUS_LABELS.includes(label)),
+      ['ai-human-review'],
+    );
+    assert.ok(labels.some(label => (label.name || label) === TRIGGER_LABEL));
+    const event = events.records.find(entry => entry.action === 'push_failed');
+    assert.equal(event.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.match(event.result, /GitHub branch push failed/);
+    assert.doesNotMatch(event.result, /PUSHSECRET|ghp_PUSHSECRET/);
+    assert.equal(client.log.filter(entry => entry.op === 'createPullRequest').length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('PR creation failure is persisted, redacted, labelled, and does not retry', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-pr-failure-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const events = createGithubEventLog({ now: () => '2026-09-28T00:00:00.000Z' });
+  let prCalls = 0;
+  client.createPullRequest = async () => {
+    prCalls += 1;
+    throw new Error('GitHub API timeout: Authorization: Bearer gho_PRSECRET');
+  };
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      eventLog: events,
+      runImplementation: async ({ branch }) => ({
+        ok: true,
+        tests: 'PASS',
+        review: 'SKIP',
+        commit: 'b'.repeat(40),
+        branch,
+      }),
+      gitPush: async ({ force }) => {
+        assert.equal(force, false);
+        return { sha: 'b'.repeat(40) };
+      },
+    });
+    assert.equal(result.code, 1);
+    assert.equal(prCalls, 1);
+    assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(result.state.commitSha, 'b'.repeat(40));
+    assert.match(result.state.branch, /^ai\/issue-42-/);
+    assert.equal(result.state.branchPushed, true);
+    assert.equal(result.state.unsafePushPending, false);
+    assert.equal(result.state.prNumber, null);
+    assert.match(result.state.lastFailure, /GitHub PR creation failed/);
+    assert.doesNotMatch(result.state.lastFailure, /PRSECRET|gho_PRSECRET|Bearer/);
+    assert.match(result.state.lastDiagnosis, /branch was pushed/i);
+    const saved = await loadIssueState('owner/app', 42, env);
+    assert.equal(saved.branchPushed, true);
+    assert.equal(saved.unsafePushPending, false);
+    const labels = await client.getLabels('owner', 'app', 42);
+    assert.deepEqual(
+      labels.map(label => label.name || label).filter(label => STATUS_LABELS.includes(label)),
+      ['ai-human-review'],
+    );
+    const event = events.records.find(entry => entry.action === 'pr_creation_failed');
+    assert.equal(event.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.doesNotMatch(event.result, /PRSECRET|gho_PRSECRET|Bearer/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
