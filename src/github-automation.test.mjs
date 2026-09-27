@@ -15,6 +15,7 @@ import {
   applyLabels,
   assertRequiredReviewRoute,
   diagnoseImplementationGateFailure,
+  isEstablishedExecutionRoute,
   REQUIRED_REVIEW_NEEDS_TEAM,
 } from './github-automation.mjs';
 import { acquireIssueLock, loadIssueState, saveIssueState, emptyState } from './github-state.mjs';
@@ -1715,5 +1716,313 @@ test('escaped quoted push secrets leave no suffix in state, events, or CLI outpu
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  }
+});
+
+test('isEstablishedExecutionRoute recognizes concrete workers only', () => {
+  assert.equal(isEstablishedExecutionRoute('CODEX'), true);
+  assert.equal(isEstablishedExecutionRoute('cursor'), true);
+  assert.equal(isEstablishedExecutionRoute('GEMINI'), true);
+  assert.equal(isEstablishedExecutionRoute('TEAM'), true);
+  assert.equal(isEstablishedExecutionRoute('AUTO'), false);
+  assert.equal(isEstablishedExecutionRoute(''), false);
+  assert.equal(isEstablishedExecutionRoute(null), false);
+});
+
+test('resume preserves AUTO-resolved CODEX route instead of rewriting to AUTO', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-route-auto-codex-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const commit = 'c'.repeat(40);
+  let implCalls = 0;
+  try {
+    const first = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch, routing }) => {
+        implCalls += 1;
+        assert.equal(routing.worker, 'AUTO');
+        return {
+          ok: true,
+          tests: 'PASS',
+          review: 'PASS',
+          commit,
+          branch,
+          route: 'CODEX',
+          model: 'auto',
+        };
+      },
+      gitPush: async () => ({ sha: commit }),
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'checks pending' }),
+    });
+    assert.equal(first.state.route, 'CODEX');
+    assert.equal(first.state.stage, 'WAITING_FOR_CI');
+    assert.equal(first.state.implementationAttempt, 1);
+    assert.equal(implCalls, 1);
+    const afterFirst = await loadIssueState('owner/app', 42, env);
+    assert.equal(afterFirst.route, 'CODEX');
+
+    const second = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('resume must not re-run implementation solely for route');
+      },
+      gitPush: async () => {
+        throw new Error('resume must not push again');
+      },
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'checks pending' }),
+    });
+    assert.equal(second.state.route, 'CODEX');
+    assert.notEqual(second.state.route, 'AUTO');
+    assert.equal(second.state.selectedRoute, 'AUTO');
+    assert.equal(second.state.implementationAttempt, 1);
+    assert.equal(second.state.commitSha, commit);
+    assert.equal(second.state.branch, first.state.branch);
+    assert.equal(second.state.stage, 'WAITING_FOR_CI');
+    assert.equal(implCalls, 1);
+    const saved = await loadIssueState('owner/app', 42, env);
+    assert.equal(saved.route, 'CODEX');
+    assert.equal(saved.implementationAttempt, 1);
+    assert.equal(saved.commitSha, commit);
+    assert.equal(saved.branch, first.state.branch);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('resume keeps historical CODEX when current routing would select CURSOR', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-route-codex-cursor-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = 'a'.repeat(40);
+  const branch = 'ai/issue-42-fix-checkout-validation';
+  const client = createMemoryGithubClient(seedIssue({ labels: [TRIGGER_LABEL, 'ai-cursor'] }));
+  let implCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 42, title: 'Fix checkout validation', html_url: 'https://github.com/owner/app/issues/42' },
+      }),
+      stage: 'LOCAL_TESTS',
+      localTests: 'PASS',
+      review: 'PASS',
+      commitSha: commit,
+      branch,
+      route: 'CODEX',
+      selectedRoute: 'AUTO',
+      implementationAttempt: 1,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        return { ok: true, tests: 'PASS', review: 'PASS', commit: 'wrong', branch: 'ai/wrong', route: 'CURSOR' };
+      },
+      gitPush: async () => ({ sha: commit }),
+      waitForCi: async () => ({ status: CI_STATUS.PASS, summary: 'ok' }),
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(result.state.route, 'CODEX');
+    assert.notEqual(result.state.route, 'CURSOR');
+    assert.equal(result.state.selectedRoute, 'CURSOR');
+    assert.equal(result.state.implementationAttempt, 1);
+    assert.equal(result.state.commitSha, commit);
+    assert.equal(result.state.branch, branch);
+    const saved = await loadIssueState('owner/app', 42, env);
+    assert.equal(saved.route, 'CODEX');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('manual CODEX route survives resume', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-route-manual-codex-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = 'b'.repeat(40);
+  const branch = 'ai/issue-42-fix-checkout-validation';
+  const client = createMemoryGithubClient(seedIssueNumber(42, {
+    seed: {
+      checks: {
+        [commit]: [{ name: 'test', status: 'in_progress', conclusion: null }],
+      },
+      pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #42', issueNumber: 42 }],
+    },
+  }));
+  // Override labels to manual CODEX after seedIssueNumber default.
+  const issue = await client.getIssue('owner', 'app', 42);
+  issue.labels = [{ name: TRIGGER_LABEL }, { name: 'ai-codex' }];
+  let implCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 42, title: 'Fix checkout validation', html_url: 'https://github.com/owner/app/issues/42' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      localTests: 'PASS',
+      review: 'PASS',
+      githubCi: 'PENDING',
+      commitSha: commit,
+      branch,
+      prNumber: 7,
+      route: 'CODEX',
+      selectedRoute: 'CODEX',
+      implementationAttempt: 1,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('must not re-implement');
+      },
+      gitPush: async () => {
+        throw new Error('must not push');
+      },
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(result.state.route, 'CODEX');
+    assert.equal(result.state.selectedRoute, 'CODEX');
+    assert.equal(result.state.implementationAttempt, 1);
+    assert.equal(result.state.commitSha, commit);
+    assert.equal(result.state.branch, branch);
+    assert.equal(result.state.stage, 'WAITING_FOR_CI');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('TEAM route survives resume without changing review semantics', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-route-team-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = 'e'.repeat(40);
+  const branch = 'ai/issue-42-fix-checkout-validation';
+  const client = createMemoryGithubClient(seedIssueNumber(42, {
+    seed: {
+      checks: {
+        [commit]: [{ name: 'test', status: 'in_progress', conclusion: null }],
+      },
+      pulls: [{ number: 9, head: { ref: branch, sha: commit }, body: 'Closes #42', issueNumber: 42 }],
+    },
+  }));
+  const issue = await client.getIssue('owner', 'app', 42);
+  issue.labels = [{ name: TRIGGER_LABEL }, { name: 'ai-team' }];
+  let implCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 42, title: 'Fix checkout validation', html_url: 'https://github.com/owner/app/issues/42' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      localTests: 'PASS',
+      review: 'PASS',
+      githubCi: 'PENDING',
+      commitSha: commit,
+      branch,
+      prNumber: 9,
+      route: 'TEAM',
+      selectedRoute: 'TEAM',
+      implementationAttempt: 1,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('must not re-implement');
+      },
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(result.state.route, 'TEAM');
+    assert.equal(result.state.selectedRoute, 'TEAM');
+    assert.equal(result.state.review, 'PASS');
+    assert.equal(result.state.stage, 'WAITING_FOR_CI');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('CI fix loop resume preserves original implementation route', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-route-ci-fix-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = 'f'.repeat(40);
+  const branch = 'ai/issue-6-add-divide-operation-and-tests';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: {
+      checks: {
+        [commit]: [{ name: 'test', status: 'completed', conclusion: 'failure' }],
+      },
+      pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #6', issueNumber: 6 }],
+    },
+  }));
+  let fixCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      githubCi: 'UNKNOWN',
+      localTests: 'PASS',
+      review: 'PASS',
+      commitSha: commit,
+      branch,
+      route: 'CODEX',
+      selectedRoute: 'AUTO',
+      implementationAttempt: 1,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async ({ routing }) => {
+        fixCalls += 1;
+        // Label routing remains AUTO; fix adapter is unchanged. Do not report a
+        // different route so the original implementation identity stays CODEX.
+        assert.equal(routing.worker, 'AUTO');
+        return { ok: true, tests: 'PASS', review: 'PASS', commit, branch };
+      },
+      gitPush: async () => ({ sha: commit }),
+    });
+    assert.equal(fixCalls, 4);
+    assert.equal(result.state.route, 'CODEX');
+    assert.notEqual(result.state.route, 'AUTO');
+    assert.equal(result.state.selectedRoute, 'AUTO');
+    assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
+    const saved = await loadIssueState('owner/app', 6, env);
+    assert.equal(saved.route, 'CODEX');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });

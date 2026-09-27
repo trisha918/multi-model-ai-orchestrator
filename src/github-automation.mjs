@@ -165,6 +165,18 @@ function applyImplementationResult(state, result, config) {
 export const REQUIRED_REVIEW_NEEDS_TEAM =
   'review.required=true requires the TEAM route (ai-team) because solo runs do not produce an independent AI review.';
 
+/** Concrete workers that represent an already-executed implementation route. */
+export const ESTABLISHED_EXECUTION_ROUTES = Object.freeze(['CODEX', 'CURSOR', 'GEMINI', 'TEAM']);
+
+/**
+ * True when state.route already records a real execution worker (not AUTO / empty).
+ * Resume must preserve these historical values; requested label routing may still be AUTO.
+ */
+export function isEstablishedExecutionRoute(route) {
+  const value = String(route || '').trim().toUpperCase();
+  return ESTABLISHED_EXECUTION_ROUTES.includes(value);
+}
+
 /**
  * Fail closed before workers when required independent review cannot be produced.
  * AUTO and solo routes (CURSOR/CODEX/GEMINI) are incompatible with review.required.
@@ -670,9 +682,14 @@ export async function runIssueAutomation({
 
     if (decision.action !== 'resume' || !state.mode) state.mode = config.automation.mode;
     state.maxAttempts = config.automation.max_fix_attempts || state.maxAttempts;
-    state.route = routing.worker;
-    state.model = routing.selection === 'MANUAL' ? routing.model : 'AUTO';
+    // selectedRoute tracks the currently requested label routing (may be AUTO).
+    // state.route is the actual execution worker once implementation has recorded one;
+    // resume must not rewrite that historical identity from a fresh routing pass.
     state.selectedRoute = routing.worker;
+    if (decision.action !== 'resume' || !isEstablishedExecutionRoute(state.route)) {
+      state.route = routing.worker;
+    }
+    state.model = routing.selection === 'MANUAL' ? routing.model : 'AUTO';
     state.selectedModels = state.model;
     if (!skipStartedHop) applyStage(state, 'STARTED');
 
