@@ -20,6 +20,8 @@ import {
 import { acquireIssueLock, loadIssueState, saveIssueState, emptyState } from './github-state.mjs';
 import { TRIGGER_LABEL, STOP_LABEL, STATUS_LABELS, RoutingConflictError } from './github-labels.mjs';
 import { authorizeAiAutoTrigger } from './github-auth.mjs';
+import { createGithubEventLog } from './github-events.mjs';
+import { formatGithubStatus } from './github-pr.mjs';
 
 const assisted = parseRepoConfigText(`
 automation:
@@ -1501,4 +1503,217 @@ test('status-label reconciliation uses fresh copies from GitHub and stays idempo
   await apply('FAILED');
   assertStage('ai-failed');
   assert.ok(!server.labels.has('ai-working'));
+});
+
+test('push failure is persisted, redacted, labelled, and logged for human review', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-push-failure-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const events = createGithubEventLog({ now: () => '2026-09-28T00:00:00.000Z' });
+  let pushCalls = 0;
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      eventLog: events,
+      runImplementation: async ({ branch }) => ({
+        ok: true,
+        tests: 'PASS',
+        review: 'SKIP',
+        commit: 'a'.repeat(40),
+        branch,
+      }),
+      gitPush: async ({ force }) => {
+        pushCalls += 1;
+        assert.equal(force, false);
+        throw new Error('remote rejected push: GITHUB_TOKEN=ghp_PUSHSECRET');
+      },
+    });
+    assert.equal(result.code, 1);
+    assert.equal(pushCalls, 1);
+    assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(result.state.commitSha, 'a'.repeat(40));
+    assert.match(result.state.branch, /^ai\/issue-42-/);
+    assert.equal(result.state.unsafePushPending, true);
+    assert.match(result.state.lastFailure, /GitHub branch push failed/);
+    assert.doesNotMatch(result.state.lastFailure, /PUSHSECRET|ghp_PUSHSECRET/);
+    assert.match(result.state.lastDiagnosis, /outcome is unknown/i);
+    const saved = await loadIssueState('owner/app', 42, env);
+    assert.equal(saved.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(saved.commitSha, 'a'.repeat(40));
+    const labels = await client.getLabels('owner', 'app', 42);
+    assert.deepEqual(
+      labels.map(label => label.name || label).filter(label => STATUS_LABELS.includes(label)),
+      ['ai-human-review'],
+    );
+    assert.ok(labels.some(label => (label.name || label) === TRIGGER_LABEL));
+    const event = events.records.find(entry => entry.action === 'push_failed');
+    assert.equal(event.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.match(event.result, /GitHub branch push failed/);
+    assert.doesNotMatch(event.result, /PUSHSECRET|ghp_PUSHSECRET/);
+    assert.equal(client.log.filter(entry => entry.op === 'createPullRequest').length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('PR creation failure is persisted, redacted, labelled, and does not retry', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-pr-failure-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const events = createGithubEventLog({ now: () => '2026-09-28T00:00:00.000Z' });
+  let prCalls = 0;
+  client.createPullRequest = async () => {
+    prCalls += 1;
+    throw new Error('GitHub API timeout: Authorization: Bearer gho_PRSECRET');
+  };
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      eventLog: events,
+      runImplementation: async ({ branch }) => ({
+        ok: true,
+        tests: 'PASS',
+        review: 'SKIP',
+        commit: 'b'.repeat(40),
+        branch,
+      }),
+      gitPush: async ({ force }) => {
+        assert.equal(force, false);
+        return { sha: 'b'.repeat(40) };
+      },
+    });
+    assert.equal(result.code, 1);
+    assert.equal(prCalls, 1);
+    assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(result.state.commitSha, 'b'.repeat(40));
+    assert.match(result.state.branch, /^ai\/issue-42-/);
+    assert.equal(result.state.branchPushed, true);
+    assert.equal(result.state.unsafePushPending, false);
+    assert.equal(result.state.prNumber, null);
+    assert.match(result.state.lastFailure, /GitHub PR creation failed/);
+    assert.doesNotMatch(result.state.lastFailure, /PRSECRET|gho_PRSECRET|Bearer/);
+    assert.match(result.state.lastDiagnosis, /branch was pushed/i);
+    const saved = await loadIssueState('owner/app', 42, env);
+    assert.equal(saved.branchPushed, true);
+    assert.equal(saved.unsafePushPending, false);
+    const labels = await client.getLabels('owner', 'app', 42);
+    assert.deepEqual(
+      labels.map(label => label.name || label).filter(label => STATUS_LABELS.includes(label)),
+      ['ai-human-review'],
+    );
+    const event = events.records.find(entry => entry.action === 'pr_creation_failed');
+    assert.equal(event.stage, 'HUMAN_REVIEW_REQUIRED');
+    assert.doesNotMatch(event.result, /PRSECRET|gho_PRSECRET|Bearer/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('push failure redaction reaches state, events, and CLI output without secret remnants', async () => {
+  const cases = [
+    ['Authorization: Bearer abc123SECRET', 'abc123SECRET'],
+    ['GH_TOKEN="token with spaces"', 'token with spaces'],
+    ['api-key: "api secret value"', 'api secret value'],
+    ["password='my long password'", 'my long password'],
+    ['Authorization: bEaReR MixedCaseSecret123', 'MixedCaseSecret123'],
+  ];
+  for (const [message, secret] of cases) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-redaction-'));
+    const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+    const client = createMemoryGithubClient(seedIssue());
+    const events = createGithubEventLog();
+    try {
+      const result = await runIssueAutomation({
+        client,
+        config: assisted,
+        repo: 'owner/app',
+        issueNumber: 42,
+        env,
+        eventLog: events,
+        runImplementation: async ({ branch }) => ({
+          ok: true, tests: 'PASS', review: 'SKIP', commit: 'c'.repeat(40), branch,
+        }),
+        gitPush: async () => {
+          throw new Error(`push rejected: ${message}`);
+        },
+      });
+      const saved = await loadIssueState('owner/app', 42, env);
+      const output = formatGithubStatus({
+        issue: { number: 42, title: 'Fix checkout validation' },
+        automationMode: result.state.mode,
+        state: result.state,
+      });
+      const persisted = JSON.stringify(saved);
+      const eventPayload = JSON.stringify(events.records);
+      const escaped = new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      assert.equal(result.code, 1, message);
+      assert.doesNotMatch(persisted, escaped, `${message} leaked to state`);
+      assert.doesNotMatch(eventPayload, escaped, `${message} leaked to event`);
+      assert.doesNotMatch(output, escaped, `${message} leaked to CLI output`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('escaped quoted push secrets leave no suffix in state, events, or CLI output', async () => {
+  const cases = [
+    ['Authorization: "Bearer abc\\"def SecretSuffix"', ['abc\\"def SecretSuffix', 'SecretSuffix']],
+    ["Authorization: 'Bearer abc\\'def SecretSuffix'", ["abc\\'def SecretSuffix", 'SecretSuffix']],
+    ['GH_TOKEN="token with \\"embedded\\" secret suffix"', ['token with \\"embedded\\" secret suffix', 'secret suffix']],
+    ["GITHUB_TOKEN='token with \\'embedded\\' secret suffix'", ["token with \\'embedded\\' secret suffix", 'secret suffix']],
+    ['password="my \\"escaped\\" password value"', ['my \\"escaped\\" password value', 'password value']],
+    ["secret='my \\'escaped\\' secret value'", ["my \\'escaped\\' secret value", 'secret value']],
+    ['api-key="api \\"embedded\\" secret value"', ['api \\"embedded\\" secret value', 'secret value']],
+    ['OPENAI_API_KEY="sk-test-\\"quoted\\"-secret-suffix"', ['sk-test-\\"quoted\\"-secret-suffix', 'secret-suffix']],
+  ];
+  for (const [message, fragments] of cases) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-escaped-redaction-'));
+    const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+    const client = createMemoryGithubClient(seedIssue());
+    const events = createGithubEventLog();
+    try {
+      const result = await runIssueAutomation({
+        client,
+        config: assisted,
+        repo: 'owner/app',
+        issueNumber: 42,
+        env,
+        eventLog: events,
+        runImplementation: async ({ branch }) => ({
+          ok: true, tests: 'PASS', review: 'SKIP', commit: 'd'.repeat(40), branch,
+        }),
+        gitPush: async () => {
+          throw new Error(`push rejected: ${message}`);
+        },
+      });
+      const saved = await loadIssueState('owner/app', 42, env);
+      const destinations = [
+        JSON.stringify(saved),
+        JSON.stringify(events.records),
+        formatGithubStatus({
+          issue: { number: 42, title: 'Fix checkout validation' },
+          automationMode: result.state.mode,
+          state: result.state,
+        }),
+      ];
+      assert.equal(result.code, 1, message);
+      for (const fragment of fragments) {
+        const escaped = new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        for (const destination of destinations) {
+          assert.doesNotMatch(destination, escaped, `${message} leaked ${fragment}`);
+        }
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
 });

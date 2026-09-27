@@ -167,6 +167,8 @@ export function formatGithubStatus({
     '',
     'GitHub CI:',
     state?.githubCi || 'UNKNOWN',
+    ...(state?.lastFailure ? ['', 'Failure:', state.lastFailure] : []),
+    ...(state?.lastDiagnosis ? ['', 'Diagnosis:', state.lastDiagnosis] : []),
   ].join('\n');
 }
 

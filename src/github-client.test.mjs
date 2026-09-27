@@ -42,6 +42,15 @@ test('HTTP client uses injected fetch and redacts secrets', async () => {
   assert.doesNotMatch(redactGithubText('token: ghp_LIVESECRET'), /LIVESECRET/);
 });
 
+test('GitHub redaction is idempotent and preserves ordinary bearer prose', () => {
+  const secret = 'Authorization: "Bearer abc\\"def SecretSuffix"';
+  const once = redactGithubText(secret);
+  assert.equal(redactGithubText(once), once);
+  assert.doesNotMatch(once, /SecretSuffix/);
+  assert.equal(redactGithubText('bearer of bad news'), 'bearer of bad news');
+  assert.match(redactGithubText('Bearer abc123SECRET'), /Bearer \[redacted\]/);
+});
+
 test('getChecks and listWorkflowRuns request the GitHub CI endpoints', async () => {
   const urls = [];
   const fetchImpl = async (url) => {
