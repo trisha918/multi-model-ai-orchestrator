@@ -17,6 +17,7 @@ import {
   diagnoseImplementationGateFailure,
   isEstablishedExecutionRoute,
   isEstablishedExecutionModel,
+  extractImplementationModel,
   REQUIRED_REVIEW_NEEDS_TEAM,
 } from './github-automation.mjs';
 import { acquireIssueLock, loadIssueState, saveIssueState, emptyState } from './github-state.mjs';
@@ -2305,6 +2306,374 @@ test('CI fix loop resume preserves original model when fix omits model', async (
     const saved = await loadIssueState('owner/app', 6, env);
     assert.equal(saved.model, actualModel);
     assert.equal(saved.route, 'CODEX');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('extractImplementationModel prefers top-level then live solo worker model', () => {
+  assert.equal(extractImplementationModel({ model: 'gpt-5.6-sol' }), 'gpt-5.6-sol');
+  assert.equal(extractImplementationModel({ model: 'AUTO' }), '');
+  assert.equal(extractImplementationModel({ model: 'auto' }), '');
+  assert.equal(
+    extractImplementationModel({
+      route: 'CODEX',
+      models: { route: 'CODEX', worker: { model: 'gpt-5.6-terra' } },
+    }),
+    'gpt-5.6-terra',
+  );
+  // Top-level wins when both are present (legacy/mock contract).
+  assert.equal(
+    extractImplementationModel({
+      model: 'gpt-5.6-sol',
+      route: 'CODEX',
+      models: { route: 'CODEX', worker: { model: 'gpt-5.6-terra' } },
+    }),
+    'gpt-5.6-sol',
+  );
+  // TEAM multi-stage must not flatten into a single model id.
+  assert.equal(
+    extractImplementationModel({
+      route: 'TEAM',
+      models: {
+        route: 'TEAM',
+        stages: {
+          plan: { model: 'cursor-plan' },
+          implementation: { model: 'gpt-5.6-terra' },
+          review: { model: 'gemini-review' },
+          fix: { model: 'gpt-5.6-terra' },
+        },
+      },
+    }),
+    '',
+  );
+  assert.equal(extractImplementationModel({}), '');
+  assert.equal(extractImplementationModel(null), '');
+});
+
+test('live-shaped solo result persists models.worker.model into state.model', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-live-model-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const commit = '5'.repeat(40);
+  const modelA = 'gpt-5.6-terra';
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch, routing }) => {
+        assert.equal(routing.selection, 'AUTO');
+        // Mirror live runResult / modelsJsonPayload: no top-level model field.
+        return {
+          version: 1,
+          ok: true,
+          tests: 'PASS',
+          review: 'PASS',
+          commit,
+          branch,
+          route: 'CODEX',
+          models: {
+            route: 'CODEX',
+            selection: 'auto',
+            worker: {
+              provider: 'codex',
+              profile: 'balanced',
+              model: modelA,
+              manual: false,
+              requestedAlias: 'auto',
+              reason: 'smart',
+            },
+          },
+        };
+      },
+      gitPush: async () => ({ sha: commit }),
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'checks pending' }),
+    });
+    assert.equal(result.state.model, modelA);
+    assert.notEqual(result.state.model, 'AUTO');
+    assert.equal(result.state.selectedModels, 'AUTO');
+    assert.equal(result.state.route, 'CODEX');
+    assert.equal(result.state.commitSha, commit);
+    const saved = await loadIssueState('owner/app', 42, env);
+    assert.equal(saved.model, modelA);
+    assert.equal(saved.route, 'CODEX');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('resume preserves concrete model after live-shaped AUTO implementation', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-live-model-resume-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const commit = '6'.repeat(40);
+  const modelA = 'gpt-5.6-terra';
+  let implCalls = 0;
+  try {
+    const first = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch }) => {
+        implCalls += 1;
+        return {
+          version: 1,
+          ok: true,
+          tests: 'PASS',
+          review: 'PASS',
+          commit,
+          branch,
+          route: 'CODEX',
+          models: {
+            route: 'CODEX',
+            selection: 'auto',
+            worker: { provider: 'codex', model: modelA, manual: false, requestedAlias: 'auto' },
+          },
+        };
+      },
+      gitPush: async () => ({ sha: commit }),
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'checks pending' }),
+    });
+    assert.equal(first.state.model, modelA);
+    assert.equal(first.state.route, 'CODEX');
+    assert.equal(implCalls, 1);
+
+    const second = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        throw new Error('resume must not re-run implementation');
+      },
+      gitPush: async () => {
+        throw new Error('resume must not push again');
+      },
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'checks pending' }),
+    });
+    assert.equal(second.state.model, modelA);
+    assert.equal(second.state.selectedModels, 'AUTO');
+    assert.equal(second.state.route, 'CODEX');
+    assert.equal(second.state.implementationAttempt, 1);
+    assert.equal(second.state.commitSha, commit);
+    assert.equal(second.state.branch, first.state.branch);
+    assert.equal(second.state.localTests, 'PASS');
+    assert.equal(implCalls, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('live-shaped model survives resume when current selection points elsewhere', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-live-model-change-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '7'.repeat(40);
+  const branch = 'ai/issue-42-fix-checkout-validation';
+  const modelA = 'gpt-5.6-sol';
+  const client = createMemoryGithubClient(seedIssue({ labels: [TRIGGER_LABEL, 'ai-codex-terra'] }));
+  let implCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 42, title: 'Fix checkout validation', html_url: 'https://github.com/owner/app/issues/42' },
+      }),
+      stage: 'LOCAL_TESTS',
+      localTests: 'PASS',
+      review: 'PASS',
+      commitSha: commit,
+      branch,
+      route: 'CODEX',
+      selectedRoute: 'AUTO',
+      model: modelA,
+      selectedModels: 'AUTO',
+      implementationAttempt: 1,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async () => {
+        implCalls += 1;
+        return {
+          ok: true,
+          tests: 'PASS',
+          review: 'PASS',
+          commit: 'wrong',
+          branch: 'ai/wrong',
+          route: 'CODEX',
+          models: { route: 'CODEX', worker: { model: 'gpt-5.6-terra' } },
+        };
+      },
+      gitPush: async () => ({ sha: commit }),
+      waitForCi: async () => ({ status: CI_STATUS.PASS, summary: 'ok' }),
+    });
+    assert.equal(implCalls, 0);
+    assert.equal(result.state.model, modelA);
+    assert.equal(result.state.selectedModels, 'terra');
+    assert.equal(result.state.route, 'CODEX');
+    assert.equal(result.state.commitSha, commit);
+    assert.equal(result.state.branch, branch);
+    assert.equal(result.state.localTests, 'PASS');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('legacy top-level result.model still populates state.model', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-legacy-model-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue());
+  const commit = '8'.repeat(40);
+  const modelA = 'gpt-5.6-sol';
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch }) => ({
+        ok: true,
+        tests: 'PASS',
+        review: 'PASS',
+        commit,
+        branch,
+        route: 'CODEX',
+        model: modelA,
+      }),
+      gitPush: async () => ({ sha: commit }),
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'pending' }),
+    });
+    assert.equal(result.state.model, modelA);
+    assert.equal(result.state.route, 'CODEX');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('CI fix live-shaped result updates state.model to the fix worker model', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-live-model-fix-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const commit = '9'.repeat(40);
+  const branch = 'ai/issue-6-add-divide-operation-and-tests';
+  const modelA = 'gpt-5.6-sol';
+  const modelB = 'gpt-5.6-terra';
+  const client = createMemoryGithubClient(seedIssueNumber(6, {
+    seed: {
+      checks: {
+        [commit]: [{ name: 'test', status: 'completed', conclusion: 'failure' }],
+      },
+      pulls: [{ number: 7, head: { ref: branch, sha: commit }, body: 'Closes #6', issueNumber: 6 }],
+    },
+  }));
+  let fixCalls = 0;
+  try {
+    await saveIssueState({
+      ...emptyState({
+        repo: 'owner/app',
+        issue: { number: 6, title: 'Add divide operation and tests', html_url: 'https://github.com/owner/app/issues/6' },
+      }),
+      stage: 'WAITING_FOR_CI',
+      prNumber: 7,
+      githubCi: 'UNKNOWN',
+      localTests: 'PASS',
+      review: 'PASS',
+      commitSha: commit,
+      branch,
+      route: 'CODEX',
+      selectedRoute: 'AUTO',
+      model: modelA,
+      selectedModels: 'AUTO',
+      implementationAttempt: 1,
+      mode: 'assisted',
+      maxAttempts: 5,
+    }, env);
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 6,
+      env,
+      runImplementation: async () => {
+        fixCalls += 1;
+        return {
+          ok: true,
+          tests: 'PASS',
+          review: 'PASS',
+          commit,
+          branch,
+          route: 'CODEX',
+          models: {
+            route: 'CODEX',
+            selection: 'auto',
+            worker: { provider: 'codex', model: modelB, manual: false, requestedAlias: 'auto' },
+          },
+        };
+      },
+      gitPush: async () => ({ sha: commit }),
+    });
+    assert.equal(fixCalls, 4);
+    // Last actual execution updates the single model field.
+    assert.equal(result.state.model, modelB);
+    assert.equal(result.state.route, 'CODEX');
+    assert.equal(result.state.stage, 'HUMAN_REVIEW_REQUIRED');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('TEAM multi-stage models are not flattened into state.model', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ai-orch-gh-team-no-flatten-'));
+  const env = { AI_ORCHESTRATOR_RUNTIME_ROOT: dir };
+  const client = createMemoryGithubClient(seedIssue({ labels: [TRIGGER_LABEL, 'ai-team'] }));
+  const commit = 'a'.repeat(40);
+  try {
+    const result = await runIssueAutomation({
+      client,
+      config: assisted,
+      repo: 'owner/app',
+      issueNumber: 42,
+      env,
+      runImplementation: async ({ branch }) => ({
+        version: 1,
+        ok: true,
+        tests: 'PASS',
+        review: 'PASS',
+        commit,
+        branch,
+        route: 'TEAM',
+        // No top-level model; stages only — extraction must leave requested AUTO alone.
+        models: {
+          route: 'TEAM',
+          selection: 'auto',
+          stages: {
+            plan: { provider: 'cursor', model: 'cursor-composer', manual: false },
+            implementation: { provider: 'codex', model: 'gpt-5.6-terra', manual: false },
+            review: { provider: 'gemini', model: 'gemini-2.5-pro', manual: false },
+            fix: { provider: 'codex', model: 'gpt-5.6-terra', manual: false },
+          },
+        },
+      }),
+      gitPush: async () => ({ sha: commit }),
+      waitForCi: async () => ({ status: CI_STATUS.PENDING, summary: 'pending' }),
+    });
+    assert.equal(result.state.route, 'TEAM');
+    assert.equal(result.state.model, 'AUTO');
+    assert.notEqual(result.state.model, 'gpt-5.6-terra');
+    assert.notEqual(result.state.model, 'cursor-composer');
+    assert.notEqual(result.state.model, 'gemini-2.5-pro');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
