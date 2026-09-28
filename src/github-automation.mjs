@@ -178,6 +178,16 @@ export function isEstablishedExecutionRoute(route) {
 }
 
 /**
+ * True when state.model already records a concrete implementation model
+ * (not AUTO / empty / unresolved placeholders). Resume must preserve it.
+ */
+export function isEstablishedExecutionModel(model) {
+  const value = String(model || '').trim();
+  if (!value) return false;
+  return value.toUpperCase() !== 'AUTO';
+}
+
+/**
  * Fail closed before workers when required independent review cannot be produced.
  * AUTO and solo routes (CURSOR/CODEX/GEMINI) are incompatible with review.required.
  */
@@ -682,15 +692,19 @@ export async function runIssueAutomation({
 
     if (decision.action !== 'resume' || !state.mode) state.mode = config.automation.mode;
     state.maxAttempts = config.automation.max_fix_attempts || state.maxAttempts;
-    // selectedRoute tracks the currently requested label routing (may be AUTO).
-    // state.route is the actual execution worker once implementation has recorded one;
-    // resume must not rewrite that historical identity from a fresh routing pass.
+    // selectedRoute / selectedModels track currently requested label routing
+    // (may be AUTO). state.route / state.model are the actual execution identity
+    // once implementation has recorded them; resume must not rewrite that
+    // historical provenance from a fresh routing/model-selection pass.
     state.selectedRoute = routing.worker;
     if (decision.action !== 'resume' || !isEstablishedExecutionRoute(state.route)) {
       state.route = routing.worker;
     }
-    state.model = routing.selection === 'MANUAL' ? routing.model : 'AUTO';
-    state.selectedModels = state.model;
+    const requestedModel = routing.selection === 'MANUAL' ? routing.model : 'AUTO';
+    state.selectedModels = requestedModel;
+    if (decision.action !== 'resume' || !isEstablishedExecutionModel(state.model)) {
+      state.model = requestedModel;
+    }
     if (!skipStartedHop) applyStage(state, 'STARTED');
 
     const taskCtx = buildIssueTaskContext({ issue, repository: slug, routing });
