@@ -157,9 +157,29 @@ function applyImplementationResult(state, result, config) {
   }
   if (result?.commit) state.commitSha = result.commit;
   if (result?.route) state.route = result.route;
-  if (result?.model) state.model = result.model;
+  const model = extractImplementationModel(result);
+  if (model) state.model = model;
   if (result?.branch) state.branch = result.branch;
   state.branchPushed = false;
+}
+
+/**
+ * Prefer an explicit top-level result.model (legacy mocks / adapters).
+ * Otherwise use the live solo worker model from modelsJsonPayload.
+ * TEAM multi-stage results are intentionally not flattened into one id.
+ */
+export function extractImplementationModel(result) {
+  const topLevel = String(result?.model || '').trim();
+  if (topLevel && topLevel.toUpperCase() !== 'AUTO') return topLevel;
+
+  const route = String(result?.route || result?.models?.route || '').trim().toUpperCase();
+  // TEAM exposes stages.plan/implementation/review/fix — never pick one arbitrarily.
+  if (route === 'TEAM' || result?.models?.stages) return '';
+
+  const workerModel = String(result?.models?.worker?.model || '').trim();
+  if (workerModel && workerModel.toUpperCase() !== 'AUTO') return workerModel;
+
+  return '';
 }
 
 export const REQUIRED_REVIEW_NEEDS_TEAM =
